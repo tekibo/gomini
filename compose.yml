@@ -1,11 +1,10 @@
 services:
   gomini:
-    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-your-org}/gomini:latest
-    build:
-      context: gomini
+    image: ghcr.io/tekibo/gomini:latest
     ports:
-      - "8081:8081"
+      - "4982:8081"
     volumes:
-      - ./config.json:/etc/gomini/config.json
+      - ./config.example.json:/etc/gomini/config.json
     environment:
       - TZ=UTC
+    restart: unless-stopped

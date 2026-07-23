@@ -1,10 +1,12 @@
 name: Build and Push
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*.*.*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version tag (e.g., v2.0.0)"
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -36,10 +38,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+            type=raw,value=latest,enable=true
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
