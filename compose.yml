@@ -2,9 +2,9 @@ services:
   gomini:
     image: ghcr.io/tekibo/gomini:latest
     ports:
-      - "4982:8081"
+      - "4982:4982"
     volumes:
-      - ./config.example.json:/etc/gomini/config.json
+      - ./config.json:/etc/gomini/config.json
     environment:
       - TZ=UTC
     restart: unless-stopped
