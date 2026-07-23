@@ -76,8 +76,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1beta/models", s.withMiddleware(s.handleGoogleModels))
 	s.mux.HandleFunc("POST /v1/chat/completions", s.withMiddleware(s.handleChat))
 	s.mux.HandleFunc("POST /v1/responses", s.withMiddleware(s.handleResponses))
-	s.mux.HandleFunc("POST /v1beta/models/{model}:generateContent", s.withMiddleware(s.handleGoogleGenerate(false)))
-	s.mux.HandleFunc("POST /v1beta/models/{model}:streamGenerateContent", s.withMiddleware(s.handleGoogleGenerate(true)))
+	s.mux.HandleFunc("POST /v1beta/models/", s.withMiddleware(s.handleGoogleV1beta))
 	s.mux.HandleFunc("GET /", s.handleHealth)
 	s.mux.HandleFunc("OPTIONS /", s.handleCORS)
 }

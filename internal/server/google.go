@@ -41,163 +41,163 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleGoogleGenerate(stream bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req map[string]any
-		if err := parseBody(r, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
-			return
-		}
+func (s *Server) handleGoogleV1beta(w http.ResponseWriter, r *http.Request) {
+	var req map[string]any
+	if err := parseBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
+		return
+	}
 
-		modelName := r.PathValue("model")
-		if modelName == "" {
-			modelName = s.config.DefaultModel
-		}
+	path := strings.TrimPrefix(r.URL.Path, "/v1beta/models/")
+	modelName, action, _ := strings.Cut(path, ":")
+	if modelName == "" {
+		modelName = s.config.DefaultModel
+	}
+	stream := action == "streamGenerateContent"
 
-		resolvedName, modelID, thinkMode, extra, err := gemini.ResolveModel(modelName, s.config.DefaultModel)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
-			return
-		}
+	resolvedName, modelID, thinkMode, extra, err := gemini.ResolveModel(modelName, s.config.DefaultModel)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
+		return
+	}
 
-		var contents []tools.GoogleContent
-		if rawContents, ok := req["contents"].([]any); ok {
-			for _, rc := range rawContents {
-				b, _ := json.Marshal(rc)
-				var gc tools.GoogleContent
-				if err := json.Unmarshal(b, &gc); err == nil {
-					contents = append(contents, gc)
-				}
+	var contents []tools.GoogleContent
+	if rawContents, ok := req["contents"].([]any); ok {
+		for _, rc := range rawContents {
+			b, _ := json.Marshal(rc)
+			var gc tools.GoogleContent
+			if err := json.Unmarshal(b, &gc); err == nil {
+				contents = append(contents, gc)
 			}
 		}
+	}
 
-		systemText := ""
-		if si, ok := req["systemInstruction"].(map[string]any); ok {
-			if parts, ok := si["parts"].([]any); ok {
-				var texts []string
-				for _, p := range parts {
-					if part, ok := p.(map[string]any); ok {
-						if t, ok := part["text"].(string); ok {
-							texts = append(texts, t)
-						}
+	systemText := ""
+	if si, ok := req["systemInstruction"].(map[string]any); ok {
+		if parts, ok := si["parts"].([]any); ok {
+			var texts []string
+			for _, p := range parts {
+				if part, ok := p.(map[string]any); ok {
+					if t, ok := part["text"].(string); ok {
+						texts = append(texts, t)
 					}
 				}
-				systemText = strings.Join(texts, " ")
 			}
+			systemText = strings.Join(texts, " ")
 		}
+	}
 
-		var toolDefs []tools.ToolDef
-		fcMode := "AUTO"
-		if tc, ok := req["toolConfig"].(map[string]any); ok {
-			if fcc, ok := tc["functionCallingConfig"].(map[string]any); ok {
-				if m, ok := fcc["mode"].(string); ok {
-					fcMode = m
-				}
+	var toolDefs []tools.ToolDef
+	fcMode := "AUTO"
+	if tc, ok := req["toolConfig"].(map[string]any); ok {
+		if fcc, ok := tc["functionCallingConfig"].(map[string]any); ok {
+			if m, ok := fcc["mode"].(string); ok {
+				fcMode = m
 			}
 		}
-		if rawTools, ok := req["tools"].([]any); ok && fcMode != "NONE" {
-			for _, rt := range rawTools {
-				toolGroup, ok := rt.(map[string]any)
+	}
+	if rawTools, ok := req["tools"].([]any); ok && fcMode != "NONE" {
+		for _, rt := range rawTools {
+			toolGroup, ok := rt.(map[string]any)
+			if !ok {
+				continue
+			}
+			fns, ok := toolGroup["functionDeclarations"].([]any)
+			if !ok {
+				continue
+			}
+			for _, fn := range fns {
+				fnMap, ok := fn.(map[string]any)
 				if !ok {
 					continue
 				}
-				fns, ok := toolGroup["functionDeclarations"].([]any)
-				if !ok {
-					continue
+				td := tools.ToolDef{
+					Name:        toString(fnMap["name"]),
+					Description: toString(fnMap["description"]),
+					Parameters:  fnMap["parameters"],
 				}
-				for _, fn := range fns {
-					fnMap, ok := fn.(map[string]any)
-					if !ok {
-						continue
-					}
-					td := tools.ToolDef{
-						Name:        toString(fnMap["name"]),
-						Description: toString(fnMap["description"]),
-						Parameters:  fnMap["parameters"],
-					}
-					if td.Parameters == nil {
-						td.Parameters = fnMap["parametersJsonSchema"]
-					}
-					toolDefs = append(toolDefs, td)
+				if td.Parameters == nil {
+					td.Parameters = fnMap["parametersJsonSchema"]
 				}
+				toolDefs = append(toolDefs, td)
 			}
 		}
+	}
 
-		prompt, images := tools.GoogleContentsToPrompt(contents, systemText, toolDefs, fcMode)
-		if prompt == "" {
-			writeJSON(w, http.StatusBadRequest, errorObj("empty content"))
-			return
-		}
+	prompt, images := tools.GoogleContentsToPrompt(contents, systemText, toolDefs, fcMode)
+	if prompt == "" {
+		writeJSON(w, http.StatusBadRequest, errorObj("empty content"))
+		return
+	}
 
-		fileRefs := s.uploadImages(r.Context(), images)
+	fileRefs := s.uploadImages(r.Context(), images)
 
-		hasTools := len(toolDefs) > 0 && fcMode != "NONE"
+	hasTools := len(toolDefs) > 0 && fcMode != "NONE"
 
-		if stream && !hasTools {
-			s.streamGoogleGenerate(w, r.Context(), resolvedName, modelID, thinkMode, extra, prompt, fileRefs)
-			return
-		}
+	if stream && !hasTools {
+		s.streamGoogleGenerate(w, r.Context(), resolvedName, modelID, thinkMode, extra, prompt, fileRefs)
+		return
+	}
 
-		text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
-			return
-		}
+	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
+		return
+	}
 
-		var responseParts []map[string]any
-		if hasTools && text != "" {
-			cleanText, funcCalls := tools.ParseGoogleFunctionCalls(text)
-			if len(funcCalls) > 0 {
-				if cleanText != "" {
-					responseParts = append(responseParts, map[string]any{"text": cleanText})
-				}
-				for _, fc := range funcCalls {
-					responseParts = append(responseParts, map[string]any{
-						"functionCall": map[string]any{
-							"name": fc.Name,
-							"args": fc.Args,
-						},
-					})
-				}
-			} else {
-				responseParts = append(responseParts, map[string]any{"text": text})
+	var responseParts []map[string]any
+	if hasTools && text != "" {
+		cleanText, funcCalls := tools.ParseGoogleFunctionCalls(text)
+		if len(funcCalls) > 0 {
+			if cleanText != "" {
+				responseParts = append(responseParts, map[string]any{"text": cleanText})
+			}
+			for _, fc := range funcCalls {
+				responseParts = append(responseParts, map[string]any{
+					"functionCall": map[string]any{
+						"name": fc.Name,
+						"args": fc.Args,
+					},
+				})
 			}
 		} else {
-			responseText := text
-			if responseText == "" {
-				responseText = "I apologize, but I was unable to generate a response. Please try again."
-			}
-			responseParts = append(responseParts, map[string]any{"text": responseText})
+			responseParts = append(responseParts, map[string]any{"text": text})
 		}
+	} else {
+		responseText := text
+		if responseText == "" {
+			responseText = "I apologize, but I was unable to generate a response. Please try again."
+		}
+		responseParts = append(responseParts, map[string]any{"text": responseText})
+	}
 
-		candidate := map[string]any{
-			"content": map[string]any{
-				"parts": responseParts,
-				"role":  "model",
-			},
-			"finishReason": "STOP",
-			"index":        0,
-		}
-		usage := map[string]int{
-			"promptTokenCount":     usageTokens(prompt),
-			"candidatesTokenCount": usageTokens(text),
-			"totalTokenCount":     usageTokens(prompt + text),
-		}
-		responseObj := map[string]any{
-			"candidates":    []map[string]any{candidate},
-			"usageMetadata": usage,
-			"modelVersion":  resolvedName,
-		}
+	candidate := map[string]any{
+		"content": map[string]any{
+			"parts": responseParts,
+			"role":  "model",
+		},
+		"finishReason": "STOP",
+		"index":        0,
+	}
+	usage := map[string]int{
+		"promptTokenCount":     usageTokens(prompt),
+		"candidatesTokenCount": usageTokens(text),
+		"totalTokenCount":     usageTokens(prompt + text),
+	}
+	responseObj := map[string]any{
+		"candidates":    []map[string]any{candidate},
+		"usageMetadata": usage,
+		"modelVersion":  resolvedName,
+	}
 
-		if stream {
-			startSSE(w)
-			_ = writeSSE(w, responseObj)
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		} else {
-			writeJSON(w, http.StatusOK, responseObj)
+	if stream {
+		startSSE(w)
+		_ = writeSSE(w, responseObj)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
 		}
+	} else {
+		writeJSON(w, http.StatusOK, responseObj)
 	}
 }
 
