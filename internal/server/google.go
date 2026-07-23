@@ -210,7 +210,7 @@ func (s *Server) streamGoogleGenerate(w http.ResponseWriter, ctx context.Context
 		flusher = nopFlusher{}
 	}
 
-	fullText := ""
+	var fullText strings.Builder
 	for evt := range ch {
 		if evt.Err != nil {
 			return
@@ -218,7 +218,7 @@ func (s *Server) streamGoogleGenerate(w http.ResponseWriter, ctx context.Context
 		if evt.Delta == "" {
 			continue
 		}
-		fullText += evt.Delta
+		fullText.WriteString(evt.Delta)
 		chunk := map[string]any{
 			"candidates": []map[string]any{
 				{
@@ -243,8 +243,8 @@ func (s *Server) streamGoogleGenerate(w http.ResponseWriter, ctx context.Context
 		},
 		"usageMetadata": map[string]int{
 			"promptTokenCount":     usageTokens(prompt),
-			"candidatesTokenCount": usageTokens(fullText),
-			"totalTokenCount":      usageTokens(prompt + fullText),
+			"candidatesTokenCount": usageTokens(fullText.String()),
+			"totalTokenCount":      usageTokens(prompt + fullText.String()),
 		},
 		"modelVersion": modelName,
 	}
