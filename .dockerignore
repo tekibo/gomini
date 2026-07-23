@@ -1,0 +1,8 @@
+.git
+.gitignore
+*.md
+compose.yml
+Makefile
+config.json
+cookie.txt
+cookie.json

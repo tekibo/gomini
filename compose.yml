@@ -1,0 +1,13 @@
+services:
+  gomini:
+    build: .
+    container_name: gomini
+    ports:
+      - "4983:8081"
+    environment:
+      - GOMINI_CONFIG=/app/config.json
+      - GOMINI_PORT=8081
+      - GOMINI_HOST=0.0.0.0
+    volumes:
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
