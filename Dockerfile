@@ -1,5 +1,5 @@
 FROM golang:1.26-alpine AS build
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates=20260611-r0 tzdata=2026c-r0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

@@ -1,13 +1,11 @@
 services:
   gomini:
-    build: .
-    container_name: gomini
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-your-org}/gomini:latest
+    build:
+      context: gomini
     ports:
-      - "4983:8081"
-    environment:
-      - GOMINI_CONFIG=/app/config.json
-      - GOMINI_PORT=8081
-      - GOMINI_HOST=0.0.0.0
+      - "8081:8081"
     volumes:
-      - ./config.json:/app/config.json:ro
-    restart: unless-stopped
+      - ./config.json:/etc/gomini/config.json
+    environment:
+      - TZ=UTC
