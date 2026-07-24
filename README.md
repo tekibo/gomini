@@ -5,7 +5,7 @@
 # gomini
 
 <p align="center">
-  <img src="logo.png" width="200" alt="gomini logo">
+  <img src="logo.jpeg" width="200" alt="gomini logo">
 </p>
 
 Convert Google Gemini's web interface into an OpenAI-compatible API.
@@ -233,16 +233,19 @@ Set `"cookie_file": "/etc/gomini/cookie.txt"` in `config.json`.
 If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:
 
 **CLI flag:**
+
 ```bash
 ./gomini --proxy http://127.0.0.1:7890
 ```
 
 **config.json:**
+
 ```json
 { "proxy": "http://127.0.0.1:7890" }
 ```
 
 **Environment variable:**
+
 ```bash
 export GOMINI_PROXY=http://127.0.0.1:7890
 ./gomini
