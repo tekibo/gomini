@@ -98,6 +98,7 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thi
 
 		body := c.buildPayload(prompt, modelID, thinkMode, fileRefs, extra)
 		reqURL := c.buildURL()
+		emittedRawText := ""
 
 		var lastErr error
 		for attempt := 0; attempt < c.cfg.RetryAttempts; attempt++ {
@@ -110,7 +111,7 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thi
 				}
 			}
 
-			err := c.doStreamRequest(ctx, reqURL, body, ch)
+			err := c.doStreamRequest(ctx, reqURL, body, &emittedRawText, ch)
 			if err == nil {
 				return
 			}
@@ -138,15 +139,24 @@ func (c *Client) doRequest(ctx context.Context, reqURL, body string) (string, er
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Gemini upstream returned HTTP %d", resp.StatusCode)
+	}
+
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}
 
-	return extractResponseText(string(raw)), nil
+	rawStr := string(raw)
+	if match := bardErrorRE.FindStringSubmatch(rawStr); match != nil {
+		return "", fmt.Errorf("Gemini upstream rejected request: BardErrorInfo [%s]", match[1])
+	}
+
+	return extractResponseText(rawStr), nil
 }
 
-func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, ch chan<- StreamEvent) error {
+func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, emittedRawText *string, ch chan<- StreamEvent) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create stream request: %w", err)
@@ -159,24 +169,38 @@ func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, ch ch
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Gemini upstream returned HTTP %d", resp.StatusCode)
+	}
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	prevText := ""
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if bardErrorRE.MatchString(line) {
+			if match := bardErrorRE.FindStringSubmatch(line); match != nil {
+				return fmt.Errorf("Gemini upstream rejected request: BardErrorInfo [%s]", match[1])
+			}
+		}
+
 		texts := extractTextsFromLine(line)
 		for _, t := range texts {
-			if len(t) > len(prevText) {
-				delta := cleanText(t[len(prevText):])
-				if delta != "" {
-					select {
-					case ch <- StreamEvent{Delta: delta}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+			if t == *emittedRawText || strings.HasPrefix(*emittedRawText, t) {
+				continue
+			}
+			if !strings.HasPrefix(t, *emittedRawText) {
+				return fmt.Errorf("Gemini stream content changed during retry")
+			}
+			delta := cleanText(t[len(*emittedRawText):], false)
+			*emittedRawText = t
+			if delta != "" {
+				select {
+				case ch <- StreamEvent{Delta: delta}:
+				case <-ctx.Done():
+					return ctx.Err()
 				}
-				prevText = t
 			}
 		}
 	}
@@ -188,11 +212,19 @@ var cleanRE = regexp.MustCompile(
 	"```(?:python|javascript|text)\\?code_(?:reference|stdout)&code_event_index=\\d+\\n.*?```\\n?",
 )
 var cardRE = regexp.MustCompile(`http://googleusercontent\.com/card_content/\d+\n?`)
+var bardErrorRE = regexp.MustCompile(`BardErrorInfo\s*\[(\d+)\]`)
 
-func cleanText(text string) string {
+func cleanText(text string, strip ...bool) string {
+	doStrip := true
+	if len(strip) > 0 {
+		doStrip = strip[0]
+	}
 	text = cleanRE.ReplaceAllString(text, "")
 	text = cardRE.ReplaceAllString(text, "")
-	return strings.TrimSpace(text)
+	if doStrip {
+		text = strings.TrimSpace(text)
+	}
+	return text
 }
 
 func extractTextsFromLine(line string) []string {

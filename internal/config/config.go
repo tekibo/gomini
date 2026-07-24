@@ -31,8 +31,8 @@ func Default() *Config {
 		RetryAttempts:     3,
 		RetryDelaySec:     2,
 		RequestTimeoutSec: 180,
-		GeminiBL:          "boq_assistant-bard-web-server_20260525.09_p0",
-		DefaultModel:      "gemini-3.5-flash",
+		GeminiBL:          "boq_assistant-bard-web-server_20260723.00_p0",
+		DefaultModel:      "gemini-3.6-flash",
 		LogRequests:       true,
 	}
 }

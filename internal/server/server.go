@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -68,6 +69,13 @@ func New(cfg *Config, geminiClient GeminiClient, uploader Uploader) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.config.LogRequests {
+		clientIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+		log.Printf("%s %s %s", clientIP, r.Method, r.URL.Path)
+	}
 	s.mux.ServeHTTP(w, r)
 }
 

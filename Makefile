@@ -20,5 +20,8 @@ docker-run:
 test:
 	go test ./...
 
+test-smoke:
+	./test.sh
+
 vet:
 	go vet ./...
