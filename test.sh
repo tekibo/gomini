@@ -9,16 +9,19 @@ PASS=0
 FAIL=0
 SERVER_PID=
 
-cleanup() { kill "$SERVER_PID" 2>/dev/null || true; }
-trap cleanup EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 check() {
-  local label=$1 out
+  local label=$1
   shift
-  out=$("$@" 2>&1) && pass "$label" || fail "$label"
+  if "$@" >/dev/null 2>&1; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
 }
 
 check_body() {
