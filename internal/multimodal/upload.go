@@ -7,10 +7,159 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
+	"time"
 )
+
+const (
+	maxRemoteImageBytes     = 10 * 1024 * 1024 // 10 MiB limit
+	maxRemoteImageRedirects = 3
+)
+
+var blockedNets = []*net.IPNet{
+	mustParseCIDR("0.0.0.0/8"),
+	mustParseCIDR("100.64.0.0/10"),      // RFC 6598 CGNAT
+	mustParseCIDR("192.0.0.0/24"),       // RFC 6890
+	mustParseCIDR("192.0.2.0/24"),       // RFC 5737 TEST-NET-1
+	mustParseCIDR("198.18.0.0/15"),      // RFC 2544 Benchmark
+	mustParseCIDR("198.51.100.0/24"),    // RFC 5737 TEST-NET-2
+	mustParseCIDR("203.0.113.0/24"),     // RFC 5737 TEST-NET-3
+	mustParseCIDR("240.0.0.0/4"),        // RFC 1112 Reserved
+	mustParseCIDR("255.255.255.255/32"), // Broadcast
+	mustParseCIDR("2001:db8::/32"),      // RFC 3849 Documentation
+}
+
+func mustParseCIDR(s string) *net.IPNet {
+	_, ipnet, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return ipnet
+}
+
+// IsPublicIP reports whether ip is a publicly routable global unicast IP address.
+func IsPublicIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		ip = ipv4
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, blocked := range blockedNets {
+		if blocked.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateRemoteImageURL validates URL structure and rejects private IP literals and non-standard ports.
+func ValidateRemoteImageURL(parsed *url.URL) error {
+	if parsed == nil {
+		return fmt.Errorf("nil URL")
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return fmt.Errorf("remote image scheme must be http or https, got %q", parsed.Scheme)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("remote image URL with credentials is not allowed")
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return fmt.Errorf("remote image URL missing hostname")
+	}
+	port := parsed.Port()
+	if parsed.Scheme == "https" && port != "" && port != "443" {
+		return fmt.Errorf("remote image non-standard HTTPS port not allowed: %s", port)
+	}
+	if parsed.Scheme == "http" && port != "" && port != "80" {
+		return fmt.Errorf("remote image non-standard HTTP port not allowed: %s", port)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if !IsPublicIP(ip) {
+			return fmt.Errorf("remote image host is not a public IP: %s", host)
+		}
+	}
+	return nil
+}
+
+// ValidateHostPublic resolves host and ensures all returned IP addresses are public.
+func ValidateHostPublic(ctx context.Context, host string) error {
+	if ip := net.ParseIP(host); ip != nil {
+		if !IsPublicIP(ip) {
+			return fmt.Errorf("remote image host is not a public IP: %s", host)
+		}
+		return nil
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return fmt.Errorf("resolve remote image host %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("no IP addresses returned for host %q", host)
+	}
+	for _, ip := range ips {
+		if !IsPublicIP(ip) {
+			return fmt.Errorf("remote image host %q resolves to non-public IP %s", host, ip.String())
+		}
+	}
+	return nil
+}
+
+func newSafeHTTPClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip != nil && !IsPublicIP(ip) {
+				return fmt.Errorf("remote image destination is not a public IP: %s", host)
+			}
+			return nil
+		},
+	}
+
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxRemoteImageRedirects {
+				return fmt.Errorf("remote image exceeded redirect limit (%d)", maxRemoteImageRedirects)
+			}
+			if err := ValidateRemoteImageURL(req.URL); err != nil {
+				return fmt.Errorf("remote image redirect rejected: %w", err)
+			}
+			ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+			defer cancel()
+			if err := ValidateHostPublic(ctx, req.URL.Hostname()); err != nil {
+				return fmt.Errorf("remote image redirect rejected: %w", err)
+			}
+			return nil
+		},
+	}
+}
 
 // CookieLoader loads cookies and SAPISID tokens from a path.
 type CookieLoader interface {
@@ -68,31 +217,76 @@ func DetectImageMIME(imageBytes []byte, fallback string) string {
 	return "image/png"
 }
 
-// FetchImageBytes fetches an image from an HTTP(S) URL.
+// FetchImageBytes fetches an image from an HTTP(S) URL with SSRF protection,
+// strict redirect bounds, and size limits. If client is nil, an SSRF-safe HTTP client is used.
 func FetchImageBytes(ctx context.Context, client *http.Client, urlStr string) ([]byte, error) {
-	parsed, err := url.Parse(urlStr)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return nil, fmt.Errorf("unsupported image URL scheme: %s", urlStr)
+	if len(urlStr) > 8192 {
+		return nil, fmt.Errorf("remote image URL exceeds maximum length of 8192 characters")
 	}
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse remote image URL: %w", err)
+	}
+	if err := ValidateRemoteImageURL(parsed); err != nil {
+		return nil, err
+	}
+	if err := ValidateHostPublic(ctx, parsed.Hostname()); err != nil {
+		return nil, err
+	}
+
+	if client == nil {
+		client = newSafeHTTPClient()
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create remote image request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "image/png,image/jpeg,image/webp,image/gif,image/*;q=0.8")
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch remote image: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch image status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("remote image fetch failed with status: %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+
+	if resp.ContentLength > maxRemoteImageBytes {
+		return nil, fmt.Errorf("remote image exceeds size limit of %d bytes", maxRemoteImageBytes)
+	}
+
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if ct != "" {
+		baseType := strings.TrimSpace(strings.Split(ct, ";")[0])
+		if !strings.HasPrefix(baseType, "image/") && baseType != "application/octet-stream" {
+			return nil, fmt.Errorf("remote image response Content-Type is not an image: %s", baseType)
+		}
+	}
+
+	limited := io.LimitReader(resp.Body, maxRemoteImageBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("read remote image: %w", err)
+	}
+	if int64(len(data)) > maxRemoteImageBytes {
+		return nil, fmt.Errorf("remote image exceeds size limit of %d bytes", maxRemoteImageBytes)
+	}
+
+	detected := DetectImageMIME(data, "")
+	if detected == "" {
+		return nil, fmt.Errorf("remote image payload is not a supported raster image")
+	}
+
+	return data, nil
 }
 
-// FetchImageBytes fetches an image from an HTTP/HTTPS URL.
+// FetchImageBytes fetches an image from an HTTP/HTTPS URL with SSRF protection.
 func (u *Uploader) FetchImageBytes(ctx context.Context, urlStr string) ([]byte, error) {
-	return FetchImageBytes(ctx, u.client, urlStr)
+	return FetchImageBytes(ctx, nil, urlStr)
 }
 
 // UploadImage performs the 2-step resumable upload to Google Scotty and returns the upload blob path.
