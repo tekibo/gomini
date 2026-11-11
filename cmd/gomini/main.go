@@ -2,12 +2,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"gomini/internal/config"
 	"gomini/internal/gemini"
@@ -31,9 +33,18 @@ func main() {
 		RetryAttempts:     cfg.RetryAttempts,
 		RetryDelaySec:     cfg.RetryDelaySec,
 		RequestTimeoutSec: cfg.RequestTimeoutSec,
+		TemporaryChats:    cfg.TemporaryChats,
 	}
 
 	client := gemini.NewClient(geminiCfg)
+
+	// Attempt auto-updating BL from gemini.google.com at startup
+	blCtx, blCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if newBL, err := gemini.FetchLatestBL(blCtx, client.HTTPClient()); err == nil && newBL != "" {
+		geminiCfg.GeminiBL = newBL
+		cfg.GeminiBL = newBL
+	}
+	blCancel()
 
 	srvCfg := server.NewConfig(cfg.APIKeys, cfg.DefaultModel, cfg.LogRequests)
 
@@ -51,6 +62,8 @@ func main() {
 	log.Printf("  Base URL:  http://localhost:%d/v1", cfg.Port)
 	log.Printf("  Cookie:    %s", boolStr(cfg.CookieFile != nil && *cfg.CookieFile != ""))
 	log.Printf("  Proxy:     %s", orStr(proxyStr(cfg.Proxy), "none"))
+	log.Printf("  BL:        %s", cfg.GeminiBL)
+	log.Printf("  Temporary: %s", boolStr(cfg.TemporaryChats))
 
 	httpSrv := &http.Server{
 		Addr:    addr,

@@ -19,6 +19,7 @@ func (c *Config) ApplyFlags() {
 	proxy := flag.String("proxy", "", "HTTP proxy URL")
 	authUser := flag.String("auth-user", "", "Google auth user index")
 	xsrfToken := flag.String("xsrf-token", "", "XSRF token")
+	tempChats := flag.Bool("temporary-chats", c.TemporaryChats, "use temporary chats (do not persist history)")
 	configPath := flag.String("config", "", "path to config file")
 	flag.Parse()
 
@@ -30,6 +31,7 @@ func (c *Config) ApplyFlags() {
 	c.GeminiBL = *geminiBL
 	c.DefaultModel = *defaultModel
 	c.LogRequests = *logReqs
+	c.TemporaryChats = *tempChats
 	if *cookieFile != "" {
 		c.CookieFile = cookieFile
 	}

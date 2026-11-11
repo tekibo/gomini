@@ -30,6 +30,7 @@ type ContentPart struct {
 
 type ImageData struct {
 	Data     []byte
+	URL      string
 	MIMEType string
 }
 

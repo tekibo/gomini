@@ -35,6 +35,43 @@ type Config struct {
 	Port              int
 	Host              string
 	APIKeys           []string
+	TemporaryChats    bool
+}
+
+var reBL = regexp.MustCompile(`(boq_assistant-bard-web-server_\d+\.\d+_p\d+)`)
+
+// FetchLatestBL attempts to scrape the latest gemini_bl from gemini.google.com/app.
+func FetchLatestBL(ctx context.Context, client *http.Client) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://gemini.google.com/app", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	m := reBL.FindSubmatch(body)
+	if len(m) > 1 {
+		return string(m[1]), nil
+	}
+	return "", fmt.Errorf("gemini_bl not found on page")
+}
+
+func (c *Client) UpdateBLIfNeeded(ctx context.Context) bool {
+	newBL, err := FetchLatestBL(ctx, c.http)
+	if err == nil && newBL != "" && newBL != c.cfg.GeminiBL {
+		c.log(fmt.Sprintf("BL auto-updated: %s -> %s", c.cfg.GeminiBL, newBL))
+		c.cfg.GeminiBL = newBL
+		return true
+	}
+	return false
 }
 
 func NewClient(cfg *Config) *Client {
@@ -84,6 +121,14 @@ func (c *Client) Generate(ctx context.Context, prompt string, modelID, thinkMode
 		if err == nil {
 			return text, nil
 		}
+		if strings.Contains(err.Error(), "HTTP 405") && c.UpdateBLIfNeeded(ctx) {
+			c.log("Retrying with updated BL...")
+			reqURL = c.buildURL()
+			text, err = c.doRequest(ctx, reqURL, body)
+			if err == nil {
+				return text, nil
+			}
+		}
 		lastErr = err
 		c.log(fmt.Sprintf("Retry %d/%d: %v", attempt+1, c.cfg.RetryAttempts, err))
 	}
@@ -115,6 +160,16 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thi
 			if err == nil {
 				return
 			}
+			if strings.Contains(err.Error(), "HTTP 405") && c.UpdateBLIfNeeded(ctx) {
+				c.log("BL updated, falling back to non-streaming for this request")
+				raw, genErr := c.Generate(ctx, prompt, modelID, thinkMode, fileRefs, extra)
+				if genErr == nil && raw != "" {
+					ch <- StreamEvent{Delta: raw}
+				} else if genErr != nil {
+					ch <- StreamEvent{Err: genErr}
+				}
+				return
+			}
 			lastErr = err
 			c.log(fmt.Sprintf("Stream retry %d/%d: %v", attempt+1, c.cfg.RetryAttempts, err))
 		}
@@ -140,7 +195,7 @@ func (c *Client) doRequest(ctx context.Context, reqURL, body string) (string, er
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Gemini upstream returned HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("gemini upstream returned HTTP %d", resp.StatusCode)
 	}
 
 	raw, err := io.ReadAll(resp.Body)
@@ -150,7 +205,7 @@ func (c *Client) doRequest(ctx context.Context, reqURL, body string) (string, er
 
 	rawStr := string(raw)
 	if match := bardErrorRE.FindStringSubmatch(rawStr); match != nil {
-		return "", fmt.Errorf("Gemini upstream rejected request: BardErrorInfo [%s]", match[1])
+		return "", fmt.Errorf("gemini upstream rejected request: BardErrorInfo [%s]", match[1])
 	}
 
 	return extractResponseText(rawStr), nil
@@ -170,7 +225,7 @@ func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, emitt
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Gemini upstream returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("gemini upstream returned HTTP %d", resp.StatusCode)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -181,7 +236,7 @@ func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, emitt
 
 		if bardErrorRE.MatchString(line) {
 			if match := bardErrorRE.FindStringSubmatch(line); match != nil {
-				return fmt.Errorf("Gemini upstream rejected request: BardErrorInfo [%s]", match[1])
+				return fmt.Errorf("gemini upstream rejected request: BardErrorInfo [%s]", match[1])
 			}
 		}
 
@@ -191,7 +246,7 @@ func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, emitt
 				continue
 			}
 			if !strings.HasPrefix(t, *emittedRawText) {
-				return fmt.Errorf("Gemini stream content changed during retry")
+				return fmt.Errorf("gemini stream content changed during retry")
 			}
 			delta := cleanText(t[len(*emittedRawText):], false)
 			*emittedRawText = t
@@ -326,7 +381,12 @@ func (c *Client) buildPayload(prompt string, modelID, thinkMode int, fileRefs []
 	inner[18] = 0
 	inner[27] = 1
 	inner[30] = []int{4}
-	inner[41] = []int{2}
+	if c.cfg.TemporaryChats {
+		inner[41] = []int{1}
+		inner[45] = 1
+	} else {
+		inner[41] = []int{2}
+	}
 	inner[53] = 0
 	inner[59] = uuid()
 	inner[61] = []any{}
@@ -396,5 +456,5 @@ func uuid() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-func (c *Client) HTTPClient() *http.Client { return c.http }
+func (c *Client) HTTPClient() *http.Client  { return c.http }
 func (c *Client) CookieStore() *CookieStore { return c.cs }

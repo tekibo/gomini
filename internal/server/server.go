@@ -29,12 +29,13 @@ type GeminiClient interface {
 
 type Uploader interface {
 	UploadImage(ctx context.Context, imageBytes []byte, mimeType string) (string, error)
+	FetchImageBytes(ctx context.Context, urlStr string) ([]byte, error)
 }
 
 type Config struct {
-	APIKeys       []string
-	DefaultModel  string
-	LogRequests   bool
+	APIKeys      []string
+	DefaultModel string
+	LogRequests  bool
 }
 
 func NewConfig(apiKeys []string, defaultModel string, logReqs bool) *Config {
@@ -86,6 +87,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/responses", s.withMiddleware(s.handleResponses))
 	s.mux.HandleFunc("POST /v1beta/models/", s.withMiddleware(s.handleGoogleV1beta))
 	s.mux.HandleFunc("GET /", s.handleHealth)
+	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("OPTIONS /", s.handleCORS)
 }
 
@@ -131,7 +133,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
+		"status":  "ok",
 		"version": version,
 	})
 }

@@ -11,5 +11,6 @@
   "api_keys": [],
   "cookie_file": null,
   "proxy": null,
-  "log_requests": true
+  "log_requests": true,
+  "temporary_chats": false
 }

@@ -35,8 +35,8 @@ func GoogleContentsToPrompt(contents []GoogleContent, systemInstruction string, 
 		for _, p := range content.Parts {
 			b, _ := json.Marshal(p)
 			var part struct {
-				Text         string `json:"text"`
-				InlineData   *struct {
+				Text       string `json:"text"`
+				InlineData *struct {
 					Data     string `json:"data"`
 					MIMEType string `json:"mimeType"`
 				} `json:"inlineData,omitempty"`

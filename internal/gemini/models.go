@@ -16,14 +16,15 @@ type ModelConfig struct {
 }
 
 var Models = map[string]ModelConfig{
-	"gemini-3.6-flash":              {Mode: 1, Think: 4, Desc: "Latest all-around model (Gemini 3.6 Flash)"},
-	"gemini-3.5-flash":              {Mode: 1, Think: 4, Desc: "Alias for gemini-3.6-flash (backend upgraded)"},
-	"gemini-3.5-flash-thinking":     {Mode: 2, Think: 0, Desc: "Deep thinking mode, longest output (~20k chars)"},
-	"gemini-3.1-pro":               {Mode: 3, Think: 4, Desc: "Pro model (requires cookie for real routing)"},
-	"gemini-3.1-pro-enhanced":      {Mode: 3, Think: 4, Extra: map[int]int{31: 2, 80: 3}, Desc: "Pro with enhanced output (experimental)"},
-	"gemini-auto":                  {Mode: 4, Think: 4, Desc: "Auto model selection"},
+	"gemini-3.7-flash":               {Mode: 1, Think: 4, Desc: "Latest all-around model (Gemini 3.7 Flash)"},
+	"gemini-3.6-flash":               {Mode: 1, Think: 4, Desc: "All-around model (Gemini 3.6 Flash)"},
+	"gemini-3.5-flash":               {Mode: 1, Think: 4, Desc: "Alias for gemini-3.6-flash (backend upgraded)"},
+	"gemini-3.5-flash-thinking":      {Mode: 2, Think: 0, Desc: "Deep thinking mode, longest output (~20k chars)"},
+	"gemini-3.1-pro":                 {Mode: 3, Think: 4, Desc: "Pro model (requires cookie for real routing)"},
+	"gemini-3.1-pro-enhanced":        {Mode: 3, Think: 4, Extra: map[int]int{31: 2, 80: 3}, Desc: "Pro with enhanced output (experimental)"},
+	"gemini-auto":                    {Mode: 4, Think: 4, Desc: "Auto model selection"},
 	"gemini-3.5-flash-thinking-lite": {Mode: 5, Think: 0, Desc: "Dynamic thinking with adaptive depth"},
-	"gemini-flash-lite":            {Mode: 6, Think: 4, Desc: "Lightweight fast model"},
+	"gemini-flash-lite":              {Mode: 6, Think: 4, Desc: "Lightweight fast model"},
 }
 
 func ResolveModel(name, defaultName string) (resolvedName string, mode, think int, extra map[int]int, err error) {

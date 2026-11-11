@@ -130,7 +130,11 @@ func (s *Server) handleGoogleV1beta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileRefs := s.uploadImages(r.Context(), images)
+	fileRefs, err := s.uploadImages(r.Context(), images)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
+		return
+	}
 
 	hasTools := len(toolDefs) > 0 && fcMode != "NONE"
 
@@ -182,7 +186,7 @@ func (s *Server) handleGoogleV1beta(w http.ResponseWriter, r *http.Request) {
 	usage := map[string]int{
 		"promptTokenCount":     usageTokens(prompt),
 		"candidatesTokenCount": usageTokens(text),
-		"totalTokenCount":     usageTokens(prompt + text),
+		"totalTokenCount":      usageTokens(prompt + text),
 	}
 	responseObj := map[string]any{
 		"candidates":    []map[string]any{candidate},
@@ -261,5 +265,3 @@ func toString(v any) string {
 	}
 	return fmt.Sprintf("%v", v)
 }
-
-

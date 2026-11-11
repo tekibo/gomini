@@ -22,6 +22,7 @@ type Config struct {
 	CookieFile        *string  `json:"cookie_file"`
 	Proxy             *string  `json:"proxy"`
 	APIKeys           []string `json:"api_keys"`
+	TemporaryChats    bool     `json:"temporary_chats"`
 }
 
 func Default() *Config {
@@ -34,6 +35,7 @@ func Default() *Config {
 		GeminiBL:          "boq_assistant-bard-web-server_20260723.00_p0",
 		DefaultModel:      "gemini-3.6-flash",
 		LogRequests:       true,
+		TemporaryChats:    false,
 	}
 }
 

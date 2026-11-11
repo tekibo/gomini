@@ -61,22 +61,23 @@ check "server started" kill -0 "$SERVER_PID"
 echo "=== Endpoints ==="
 
 check_body "GET  /"                  '"status":"ok"'          curl -s "$BASE/"
-check_body "GET  /v1/models"         'gemini-3.6-flash'       curl -s "$BASE/v1/models"
-check_body "GET  /v1beta/models"     'gemini-3.6-flash'       curl -s "$BASE/v1beta/models"
+check_body "GET  /health"            '"status":"ok"'          curl -s "$BASE/health"
+check_body "GET  /v1/models"         'gemini-3.7-flash'       curl -s "$BASE/v1/models"
+check_body "GET  /v1beta/models"     'gemini-3.7-flash'       curl -s "$BASE/v1beta/models"
 check_status "OPTIONS /"            204                       "$BASE/" -X OPTIONS
 
 check_body "POST /v1/chat/completions"  '"error"|"choices"|"object"' \
   curl -s -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+    -d '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 
 check_body "POST /v1/responses" '"error"|"output"|"status"' \
   curl -s -X POST "$BASE/v1/responses" \
     -H "Content-Type: application/json" \
-    -d '{"model":"gemini-3.6-flash","input":"hi"}'
+    -d '{"model":"gemini-3.7-flash","input":"hi"}'
 
-check_body "POST /v1beta/models/gemini-3.6-flash:generateContent" '"error"|"candidates"' \
-  curl -s -X POST "$BASE/v1beta/models/gemini-3.6-flash:generateContent" \
+check_body "POST /v1beta/models/gemini-3.7-flash:generateContent" '"error"|"candidates"' \
+  curl -s -X POST "$BASE/v1beta/models/gemini-3.7-flash:generateContent" \
     -H "Content-Type: application/json" \
     -d '{"contents":[{"parts":[{"text":"hi"}]}]}'
 

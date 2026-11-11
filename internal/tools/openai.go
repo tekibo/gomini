@@ -1,11 +1,126 @@
 package tools
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
+
+const promptMaxBytes = 60000
+
+var dataURLRe = regexp.MustCompile(`(?s)^data:([^;,]+)?(;base64)?,(.*)$`)
+
+func decodeDataURL(rawURL string) ([]byte, string, bool) {
+	m := dataURLRe.FindStringSubmatch(rawURL)
+	if m == nil {
+		return nil, "", false
+	}
+	mime := m[1]
+	if mime == "" {
+		mime = "image/png"
+	}
+	isBase64 := m[2] != ""
+	dataPart := m[3]
+	if isBase64 {
+		decoded, err := base64.StdEncoding.DecodeString(dataPart)
+		if err != nil {
+			return nil, "", false
+		}
+		return decoded, mime, true
+	}
+	unescaped, err := url.QueryUnescape(dataPart)
+	if err != nil {
+		return nil, "", false
+	}
+	return []byte(unescaped), mime, true
+}
+
+func imageFromURL(rawURL, defaultMIME string) (ImageData, bool) {
+	if rawURL == "" {
+		return ImageData{}, false
+	}
+	if strings.HasPrefix(rawURL, "data:") {
+		data, mime, ok := decodeDataURL(rawURL)
+		if !ok {
+			return ImageData{}, false
+		}
+		return ImageData{Data: data, MIMEType: mime}, true
+	}
+	mime := defaultMIME
+	if mime == "" {
+		mime = "image/png"
+	}
+	return ImageData{URL: rawURL, MIMEType: mime}, true
+}
+
+func imageFromPart(item any) (ImageData, bool) {
+	m, ok := item.(map[string]any)
+	if !ok {
+		b, err := json.Marshal(item)
+		if err != nil {
+			return ImageData{}, false
+		}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return ImageData{}, false
+		}
+	}
+
+	partType, _ := m["type"].(string)
+	if partType == "image_url" {
+		iu := m["image_url"]
+		if iuMap, ok := iu.(map[string]any); ok {
+			rawURL, _ := iuMap["url"].(string)
+			mime, _ := iuMap["mime_type"].(string)
+			return imageFromURL(rawURL, mime)
+		}
+		if rawURL, ok := iu.(string); ok {
+			return imageFromURL(rawURL, "")
+		}
+	}
+
+	if partType == "input_image" || partType == "image" {
+		iu := m["image_url"]
+		if iu == nil {
+			iu = m["url"]
+		}
+		if iuMap, ok := iu.(map[string]any); ok {
+			rawURL, _ := iuMap["url"].(string)
+			mime, _ := iuMap["mime_type"].(string)
+			return imageFromURL(rawURL, mime)
+		}
+		if rawURL, ok := iu.(string); ok && rawURL != "" {
+			mime, _ := m["mime_type"].(string)
+			return imageFromURL(rawURL, mime)
+		}
+
+		rawBytesVal := m["data"]
+		if rawBytesVal == nil {
+			rawBytesVal = m["base64"]
+		}
+		if s, ok := rawBytesVal.(string); ok && s != "" {
+			mime, _ := m["mime_type"].(string)
+			if mime == "" {
+				mime, _ = m["media_type"].(string)
+			}
+			if mime == "" {
+				mime = "image/png"
+			}
+			if strings.HasPrefix(s, "data:") {
+				return imageFromURL(s, mime)
+			}
+			data, err := base64.StdEncoding.DecodeString(s)
+			if err != nil {
+				return ImageData{}, false
+			}
+			return ImageData{Data: data, MIMEType: mime}, true
+		}
+	}
+
+	return ImageData{}, false
+}
 
 func MessagesToPrompt(messages []Message, tools []ToolDef, toolChoice any) (string, []ImageData) {
 	var parts []string
@@ -13,6 +128,17 @@ func MessagesToPrompt(messages []Message, tools []ToolDef, toolChoice any) (stri
 
 	if len(tools) > 0 {
 		tcStr, _ := json.MarshalIndent(tools, "", "  ")
+		if len(tcStr) > promptMaxBytes/2 {
+			type slimTool struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			}
+			slim := make([]slimTool, len(tools))
+			for i, t := range tools {
+				slim[i] = slimTool{Name: t.Name, Description: t.Description}
+			}
+			tcStr, _ = json.MarshalIndent(slim, "", "  ")
+		}
 		constraint := buildToolChoiceInstruction(toolChoice, tools)
 		parts = append(parts,
 			"# Tool Use\n\n"+
@@ -39,10 +165,13 @@ func MessagesToPrompt(messages []Message, tools []ToolDef, toolChoice any) (stri
 					continue
 				}
 				switch part.Type {
-				case "text", "input_text":
+				case "text", "input_text", "output_text":
 					texts = append(texts, part.Text)
-				case "image_url", "image":
-					texts = append(texts, "[Note: Image input not supported in this API. Please describe the image in text.]")
+				default:
+					if img, ok := imageFromPart(item); ok {
+						images = append(images, img)
+						texts = append(texts, "[Image attached]")
+					}
 				}
 			}
 			content = strings.Join(texts, " ")

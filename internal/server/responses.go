@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 	"time"
 
 	"gomini/internal/gemini"
@@ -16,7 +15,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		Instructions string          `json:"instructions"`
 		Input        json.RawMessage `json:"input"`
 		Tools        json.RawMessage `json:"tools,omitempty"`
-		ToolChoice   any     `json:"tool_choice,omitempty"`
+		ToolChoice   any             `json:"tool_choice,omitempty"`
 		Stream       bool            `json:"stream"`
 	}
 
@@ -74,33 +73,26 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 							Name:       itemObj.Name,
 							Content:    itemObj.Output,
 						})
-					case "message":
+					case "input_text", "input_image", "image", "image_url":
+						var part map[string]any
+						_ = json.Unmarshal(item, &part)
+						messages = append(messages, tools.Message{Role: "user", Content: []any{part}})
+					default:
 						role := itemObj.Role
 						if role == "" {
 							role = "user"
 						}
-						content := ""
-						if itemObj.Content != nil {
+						if len(itemObj.Content) > 0 {
 							var contentStr string
 							if err := json.Unmarshal(itemObj.Content, &contentStr); err == nil {
-								content = contentStr
+								messages = append(messages, tools.Message{Role: role, Content: contentStr})
 							} else {
-								var contentParts []struct {
-									Type string `json:"type"`
-									Text string `json:"text"`
-								}
+								var contentParts []any
 								if err := json.Unmarshal(itemObj.Content, &contentParts); err == nil {
-									var texts []string
-									for _, cp := range contentParts {
-										if cp.Type == "output_text" || cp.Type == "text" || cp.Type == "input_text" {
-											texts = append(texts, cp.Text)
-										}
-									}
-									content = strings.Join(texts, " ")
+									messages = append(messages, tools.Message{Role: role, Content: contentParts})
 								}
 							}
 						}
-						messages = append(messages, tools.Message{Role: role, Content: content})
 					}
 				}
 			}
@@ -117,9 +109,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 					toolDefs = append(toolDefs, td)
 				} else {
 					var fn struct {
-						Name        string      `json:"name"`
-						Description string      `json:"description"`
-						Parameters  any `json:"parameters"`
+						Name        string `json:"name"`
+						Description string `json:"description"`
+						Parameters  any    `json:"parameters"`
 					}
 					if err := json.Unmarshal(t, &fn); err == nil {
 						toolDefs = append(toolDefs, tools.ToolDef{
@@ -144,7 +136,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileRefs := s.uploadImages(r.Context(), images)
+	fileRefs, err := s.uploadImages(r.Context(), images)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
+		return
+	}
 	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
@@ -192,67 +188,123 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		startSSE(w)
 		flusher, _ := w.(http.Flusher)
 
-		ev := map[string]any{
-			"type": "response.created",
-			"response": map[string]any{
-				"id":     rid,
-				"object": "response",
-				"status": "in_progress",
-				"model":  resolvedName,
-				"output": []any{},
-			},
-		}
-		_ = writeSSEEvent(w, "response.created", ev)
-		if flusher != nil {
-			flusher.Flush()
-		}
-
-		for _, item := range output {
-			switch item["type"] {
-			case "function_call":
-				ev := map[string]any{
-					"type":      "response.function_call_arguments.done",
-					"item_id":   item["id"],
-					"call_id":   item["call_id"],
-					"name":      item["name"],
-					"arguments": item["arguments"],
-				}
-				_ = writeSSEEvent(w, "response.function_call_arguments.done", ev)
-				if flusher != nil {
-					flusher.Flush()
-				}
-			case "message":
-				content, _ := item["content"].([]map[string]any)
-				for ci, cp := range content {
-					ev := map[string]any{
-						"type":          "response.output_text.done",
-						"item_id":       item["id"],
-						"content_index": ci,
-						"text":          cp["text"],
-					}
-					_ = writeSSEEvent(w, "response.output_text.done", ev)
-					if flusher != nil {
-						flusher.Flush()
-					}
-				}
+		seq := 0
+		emit := func(evType string, fields map[string]any) {
+			seq++
+			fields["type"] = evType
+			fields["sequence_number"] = seq
+			_ = writeSSEEvent(w, evType, fields)
+			if flusher != nil {
+				flusher.Flush()
 			}
 		}
 
-		respObj := map[string]any{
-			"id":     rid,
-			"object": "response",
-			"status": "completed",
-			"model":  resolvedName,
-			"output": output,
-			"usage":  usage,
+		baseResp := map[string]any{
+			"id":         rid,
+			"object":     "response",
+			"created_at": time.Now().Unix(),
+			"model":      resolvedName,
 		}
-		_ = writeSSEEvent(w, "response.completed", map[string]any{
-			"type":     "response.completed",
-			"response": respObj,
-		})
-		if flusher != nil {
-			flusher.Flush()
+
+		createdResp := make(map[string]any)
+		for k, v := range baseResp {
+			createdResp[k] = v
 		}
+		createdResp["status"] = "in_progress"
+		createdResp["output"] = []any{}
+		createdResp["usage"] = nil
+
+		emit("response.created", map[string]any{"response": createdResp})
+		emit("response.in_progress", map[string]any{"response": createdResp})
+
+		for oi, item := range output {
+			switch item["type"] {
+			case "function_call":
+				pending := map[string]any{
+					"type":      "function_call",
+					"id":        item["id"],
+					"call_id":   item["call_id"],
+					"name":      item["name"],
+					"arguments": "",
+					"status":    "in_progress",
+				}
+				emit("response.output_item.added", map[string]any{
+					"output_index": oi,
+					"item":         pending,
+				})
+				emit("response.function_call_arguments.delta", map[string]any{
+					"item_id":      item["id"],
+					"output_index": oi,
+					"delta":        item["arguments"],
+				})
+				emit("response.function_call_arguments.done", map[string]any{
+					"item_id":      item["id"],
+					"output_index": oi,
+					"arguments":    item["arguments"],
+				})
+				emit("response.output_item.done", map[string]any{
+					"output_index": oi,
+					"item":         item,
+				})
+			case "message":
+				pending := map[string]any{
+					"type":    "message",
+					"id":      item["id"],
+					"role":    "assistant",
+					"status":  "in_progress",
+					"content": []any{},
+				}
+				emit("response.output_item.added", map[string]any{
+					"output_index": oi,
+					"item":         pending,
+				})
+				content, _ := item["content"].([]map[string]any)
+				for ci, cp := range content {
+					emit("response.content_part.added", map[string]any{
+						"item_id":       item["id"],
+						"output_index":  oi,
+						"content_index": ci,
+						"part": map[string]any{
+							"type":        "output_text",
+							"text":        "",
+							"annotations": []any{},
+						},
+					})
+					emit("response.output_text.delta", map[string]any{
+						"item_id":       item["id"],
+						"output_index":  oi,
+						"content_index": ci,
+						"delta":         cp["text"],
+					})
+					emit("response.output_text.done", map[string]any{
+						"item_id":       item["id"],
+						"output_index":  oi,
+						"content_index": ci,
+						"text":          cp["text"],
+					})
+					emit("response.content_part.done", map[string]any{
+						"item_id":       item["id"],
+						"output_index":  oi,
+						"content_index": ci,
+						"part":          cp,
+					})
+				}
+				emit("response.output_item.done", map[string]any{
+					"output_index": oi,
+					"item":         item,
+				})
+			}
+		}
+
+		completedResp := make(map[string]any)
+		for k, v := range baseResp {
+			completedResp[k] = v
+		}
+		completedResp["status"] = "completed"
+		completedResp["output"] = output
+		completedResp["usage"] = usage
+
+		emit("response.completed", map[string]any{"response": completedResp})
 		return
 	}
 

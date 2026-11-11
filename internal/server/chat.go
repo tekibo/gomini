@@ -16,7 +16,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Model      string          `json:"model"`
 		Messages   json.RawMessage `json:"messages"`
 		Tools      json.RawMessage `json:"tools,omitempty"`
-		ToolChoice any     `json:"tool_choice,omitempty"`
+		ToolChoice any             `json:"tool_choice,omitempty"`
 		Stream     bool            `json:"stream"`
 	}
 
@@ -91,7 +91,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileRefs := s.uploadImages(r.Context(), images)
+	fileRefs, err := s.uploadImages(r.Context(), images)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
+		return
+	}
 	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
@@ -156,7 +160,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, cid string, created int64, modelName string, modelID, thinkMode int, extra map[int]int, prompt string, images []tools.ImageData) {
-	fileRefs := s.uploadImages(ctx, images)
+	fileRefs, err := s.uploadImages(ctx, images)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
+		return
+	}
 	ch := s.gemini.GenerateStream(ctx, prompt, modelID, thinkMode, fileRefs, extra)
 
 	startSSE(w)
@@ -164,6 +172,18 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, cid stri
 	if !ok {
 		flusher = nopFlusher{}
 	}
+
+	firstChunk := map[string]any{
+		"id":      cid,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   modelName,
+		"choices": []map[string]any{
+			{"index": 0, "delta": map[string]string{"role": "assistant"}, "finish_reason": nil},
+		},
+	}
+	_ = writeSSE(w, firstChunk)
+	flusher.Flush()
 
 	for evt := range ch {
 		if evt.Err != nil {
@@ -205,20 +225,28 @@ type nopFlusher struct{}
 
 func (nopFlusher) Flush() {}
 
-func (s *Server) uploadImages(ctx context.Context, images []tools.ImageData) []string {
+func (s *Server) uploadImages(ctx context.Context, images []tools.ImageData) ([]string, error) {
 	if s.uploader == nil || len(images) == 0 {
-		return nil
+		return nil, nil
 	}
 	var refs []string
 	for _, img := range images {
-		ref, err := s.uploader.UploadImage(ctx, img.Data, img.MIMEType)
+		data := img.Data
+		if len(data) == 0 && img.URL != "" {
+			fetched, err := s.uploader.FetchImageBytes(ctx, img.URL)
+			if err != nil {
+				return nil, fmt.Errorf("image fetch failed: %w", err)
+			}
+			data = fetched
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("image fetch failed")
+		}
+		ref, err := s.uploader.UploadImage(ctx, data, img.MIMEType)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("image upload failed: %w", err)
 		}
 		refs = append(refs, ref)
 	}
-	if len(refs) == 0 {
-		return nil
-	}
-	return refs
+	return refs, nil
 }

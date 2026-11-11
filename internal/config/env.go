@@ -54,4 +54,7 @@ func (c *Config) ApplyEnv() {
 	if v := os.Getenv("GOMINI_API_KEYS"); v != "" {
 		c.APIKeys = strings.Split(v, ",")
 	}
+	if v := os.Getenv("GOMINI_TEMPORARY_CHATS"); v != "" {
+		c.TemporaryChats = v == "1" || v == "true"
+	}
 }
