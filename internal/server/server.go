@@ -129,17 +129,21 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		key, ok := strings.CutPrefix(auth, "Bearer ")
-		if !ok {
-			key = r.Header.Get("x-api-key")
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		var key string
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			key = strings.TrimSpace(auth[7:])
+		} else if auth != "" && !strings.Contains(auth, " ") {
+			key = auth
+		} else {
+			key = strings.TrimSpace(r.Header.Get("x-api-key"))
 		}
 		if key == "" {
-			writeJSON(w, http.StatusUnauthorized, errorObj("invalid api key"))
+			writeJSON(w, http.StatusUnauthorized, errorObj("invalid api key", "invalid_api_key"))
 			return
 		}
 		if !slices.Contains(s.config.APIKeys, key) {
-			writeJSON(w, http.StatusUnauthorized, errorObj("invalid api key"))
+			writeJSON(w, http.StatusUnauthorized, errorObj("invalid api key", "invalid_api_key"))
 			return
 		}
 		next(w, r)
@@ -265,9 +269,22 @@ func writeSSEEvent(w http.ResponseWriter, event string, data any) error {
 	return err
 }
 
-func errorObj(msg string) map[string]any {
+func errorObj(msg string, codeAndType ...string) map[string]any {
+	errType := "invalid_request_error"
+	var code any
+	if len(codeAndType) > 0 && codeAndType[0] != "" {
+		code = codeAndType[0]
+	}
+	if len(codeAndType) > 1 && codeAndType[1] != "" {
+		errType = codeAndType[1]
+	}
 	return map[string]any{
-		"error": map[string]string{"message": msg},
+		"error": map[string]any{
+			"message": msg,
+			"type":    errType,
+			"param":   nil,
+			"code":    code,
+		},
 	}
 }
 

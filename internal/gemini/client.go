@@ -165,15 +165,21 @@ func (c *Client) Generate(ctx context.Context, prompt string, modelID, thinkMode
 		reqURL := c.buildURL()
 
 		reqCtx := ctx
+		var ticketCancel context.CancelFunc
 		if ticketHdr != "" && c.cfg.TicketTimeoutSec > 0 {
-			var cancel context.CancelFunc
-			reqCtx, cancel = context.WithTimeout(ctx, time.Duration(c.cfg.TicketTimeoutSec)*time.Second)
-			defer cancel()
+			reqCtx, ticketCancel = context.WithTimeout(ctx, time.Duration(c.cfg.TicketTimeoutSec)*time.Second)
 		}
 
 		text, err := c.doRequest(reqCtx, reqURL, body, ticketHdr, reqUUID, len(fileRefs) > 0)
+		if ticketCancel != nil {
+			ticketCancel()
+		}
 		if err == nil {
 			return text, nil
+		}
+
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
 
 		if ticketHdr != "" {
@@ -227,14 +233,21 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thi
 			reqURL := c.buildURL()
 
 			reqCtx := ctx
+			var ticketCancel context.CancelFunc
 			if ticketHdr != "" && c.cfg.TicketTimeoutSec > 0 && emittedRawText == "" {
-				var cancel context.CancelFunc
-				reqCtx, cancel = context.WithTimeout(ctx, time.Duration(c.cfg.TicketTimeoutSec)*time.Second)
-				defer cancel()
+				reqCtx, ticketCancel = context.WithTimeout(ctx, time.Duration(c.cfg.TicketTimeoutSec)*time.Second)
 			}
 
 			err := c.doStreamRequest(reqCtx, reqURL, body, ticketHdr, reqUUID, len(fileRefs) > 0, &emittedRawText, ch)
+			if ticketCancel != nil {
+				ticketCancel()
+			}
 			if err == nil {
+				return
+			}
+
+			if ctx.Err() != nil {
+				ch <- StreamEvent{Err: ctx.Err()}
 				return
 			}
 

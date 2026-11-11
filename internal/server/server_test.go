@@ -334,3 +334,68 @@ func TestCookiesSyncEndpoint(t *testing.T) {
 		t.Errorf("expected model ticket for gemini-4-argon to be updated")
 	}
 }
+
+func TestAuthResiliencyAndErrorFormatting(t *testing.T) {
+	cfg := NewConfig([]string{"secret-key-123"}, "gemini-3.6-flash", false)
+	s := New(cfg, &mockGemini{}, &mockUploader{})
+
+	// 1. Missing auth: check full OpenAI error JSON structure
+	reqNoAuth := httptest.NewRequest("GET", "/v1/models", nil)
+	wNoAuth := httptest.NewRecorder()
+	s.ServeHTTP(wNoAuth, reqNoAuth)
+	if wNoAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", wNoAuth.Code)
+	}
+	var errResp struct {
+		Error struct {
+			Message string  `json:"message"`
+			Type    string  `json:"type"`
+			Param   *string `json:"param"`
+			Code    string  `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(wNoAuth.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error JSON: %v", err)
+	}
+	if errResp.Error.Message != "invalid api key" {
+		t.Errorf("unexpected error message: %s", errResp.Error.Message)
+	}
+	if errResp.Error.Type != "invalid_request_error" {
+		t.Errorf("unexpected error type: %s", errResp.Error.Type)
+	}
+	if errResp.Error.Code != "invalid_api_key" {
+		t.Errorf("unexpected error code: %s", errResp.Error.Code)
+	}
+
+	// 2. Case-insensitive bearer and whitespace trimming variations
+	authHeaders := []struct {
+		header string
+		val    string
+	}{
+		{"Authorization", "Bearer secret-key-123"},
+		{"Authorization", "bearer secret-key-123"},
+		{"Authorization", "  BEARER   secret-key-123  "},
+		{"Authorization", "secret-key-123"},
+		{"x-api-key", "secret-key-123"},
+		{"x-api-key", "  secret-key-123  "},
+	}
+
+	for _, tt := range authHeaders {
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		req.Header.Set(tt.header, tt.val)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 for auth %s: %q, got %d: %s", tt.header, tt.val, w.Code, w.Body.String())
+		}
+	}
+
+	// 3. Wrong key
+	reqWrong := httptest.NewRequest("GET", "/v1/models", nil)
+	reqWrong.Header.Set("Authorization", "Bearer wrong-key")
+	wWrong := httptest.NewRecorder()
+	s.ServeHTTP(wWrong, reqWrong)
+	if wWrong.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong key, got %d", wWrong.Code)
+	}
+}
