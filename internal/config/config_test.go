@@ -59,3 +59,15 @@ func TestModelTicketConfig(t *testing.T) {
 		t.Errorf("expected IdleTimeoutSec to be 120, got %d", cfg.IdleTimeoutSec)
 	}
 }
+
+func TestFlagOverridesConfigFile(t *testing.T) {
+	cfg := Default()
+	// config.json in root sets port to 4982
+	// CLI arg should override it to 8081
+	if err := cfg.ApplyArgs([]string{"-port", "8081"}); err != nil {
+		t.Fatalf("ApplyArgs error: %v", err)
+	}
+	if cfg.Port != 8081 {
+		t.Errorf("expected port 8081 from CLI flags to override config.json, got %d", cfg.Port)
+	}
+}
