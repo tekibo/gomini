@@ -13,15 +13,19 @@ Zero cost, cross-platform, single binary.
 
 ## Features
 
-- **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
+- **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth (case-insensitive with whitespace trimming) when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
-- **Responses API**: `/v1/responses` for OpenAI Codex integration
+- **Responses API**: `/v1/responses` for OpenAI Codex integration with strict sequence numbers
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
-- **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
-- **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
+- **Multimodal Image Support**: Full support for OpenAI image inputs (data URLs and remote HTTPS URLs) uploaded via Google Scotty resumable upload with SSRF protection
+- **Live Tool Calling & Streaming**: Full function calling support with live prose streaming and clean `tool_calls` delta assembly
+- **Agent Refusal Recovery**: Automated retry for canned Gemini refusal phrases and tutorial misdirections
+- **Latest Models**: Support for `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.1-pro`, and thinking variants
+- **Thinking Depth Controls**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest), `-low`/`-medium`/`-high` model suffixes, or OpenAI `reasoning_effort`
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Streaming**: SSE streaming with retry and continuity checking
+- **Cookie Formats & Auto-Sync**: Netscape `cookies.txt` (including `#HttpOnly_`), JSON, or live browser extension sync via `POST /v1/cookies`
+- **Dynamic BL & XSRF Refresh**: Automatically scrapes latest build labels and XSRF tokens from `gemini.google.com/app`
+- **Temporary Chats**: Optional incognito mode (`temporary_chats: true`) to avoid polluting Google account history
 - **Single binary**: Pure Go, zero external dependencies
 - **Cross-Platform**: Linux, macOS, Windows (Docker or native binary)
 
@@ -80,86 +84,78 @@ Supports Google native API endpoints:
 
 ## Available Models
 
-| Model                            | Description                         | Output         |
-| -------------------------------- | ----------------------------------- | -------------- |
-| `gemini-3.6-flash`               | All-around model (latest)           | ~12k chars     |
-| `gemini-3.5-flash`               | Alias for gemini-3.6-flash          | ~12k chars     |
-| `gemini-3.5-flash-thinking`      | Extended thinking, longest output   | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth             | ~15k chars     |
-| `gemini-3.1-pro`                 | Advanced math & code (needs cookie) | ~12k chars     |
-| `gemini-auto`                    | Auto model selection                | varies         |
-| `gemini-flash-lite`              | Fastest answers, lightweight        | ~10k chars     |
+| Model | Description | Output |
+|---|---|---|
+| `gemini-4-argon` | Next-generation flagship model (needs model ticket/cookie) | ~15k chars |
+| `gemini-4-argon-low` / `-medium` / `-high` | Argon with thinking depth variants | ~15k-25k chars |
+| `gemini-3.8-flash` | High-efficiency fast model with deep thinking | ~12k chars |
+| `gemini-3.8-flash-thinking` | Extended thinking mode for 3.8 Flash | **~25k chars** |
+| `gemini-3.7-flash` | Standard Gemini Flash model | ~12k chars |
+| `gemini-3.6-flash` | All-around balanced model | ~12k chars |
+| `gemini-3.1-pro` | Advanced math & reasoning (needs cookie) | ~12k chars |
+| `gemini-auto` | Automatic model selection | varies |
+| `gemini-flash-lite` | Fastest lightweight answers | ~10k chars |
 
-### Thinking Depth
+### Thinking Depth Controls
 
-Append `@think=N` to any model name:
+You can control reasoning effort and thinking depth in 3 convenient ways:
 
+1. **OpenAI `reasoning_effort` parameter**:
+   Set `"reasoning_effort": "low"`, `"medium"`, or `"high"` in your chat request payload.
+2. **Model Name Suffixes**:
+   Append `-low`, `-medium`, or `-high` directly to model names (e.g. `gemini-4-argon-high`, `gemini-3.8-flash:high`).
+3. **Explicit `@think=N` tag**:
+   ```
+   gemini-3.8-flash@think=0      # deepest thinking (high)
+   gemini-3.8-flash@think=2      # balanced thinking (medium)
+   gemini-3.8-flash@think=4      # fast / minimal thinking (low)
+   ```
+
+## Multimodal Input (Images)
+
+`gomini` supports image inputs formatted according to the OpenAI Vision specification:
+- **Base64 Data URLs**: `data:image/png;base64,...`
+- **Remote HTTPS Image URLs**: `https://example.com/photo.jpg`
+
+Images are securely uploaded via Google's Scotty resumable upload protocol and bound to the conversation.
+
+### SSRF & Security Protections
+For remote image URLs, `gomini` includes strict SSRF defenses:
+- Rejects non-routable, private, loopback (`127.0.0.1`, `localhost`), and link-local cloud metadata (`169.254.169.254`) IP addresses.
+- Enforces pre-dial DNS validation and socket-level connection checks (`net.Dialer.Control`) to prevent DNS rebinding attacks.
+- Enforces a maximum download limit of **10 MiB** and a maximum of **3 HTTP redirects**.
+- Validates image magic bytes (PNG, JPEG, GIF, WEBP, BMP, TIFF, AVIF, HEIC).
+
+## Cookies & Authentication for Pro / Argon
+
+Anonymous access works for Flash models, but `gemini-4-argon` and `gemini-3.1-pro` require authenticated Google cookies.
+
+### 1. Browser Extension Auto-Sync (Recommended)
+You can sync cookies automatically from your browser using the local sync endpoint:
+```bash
+POST /v1/cookies
+Headers: X-Gemini-Cookie-Sync: 1 (or chrome-extension:// Origin)
+Body: {"cookie": "SID=...; SAPISID=..."}
 ```
-gemini-3.6-flash@think=0      # deepest (default)
-gemini-3.6-flash@think=2      # medium
-gemini-3.6-flash@think=4      # shallowest
-```
+This endpoint includes DNS rebinding protection and binds only to localhost.
 
-## Optional: Cookie for Pro
-
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
-
+### 2. Netscape `cookies.txt` or Text Format
+Export cookies using any standard browser extension (like *Get cookies.txt LOCALLY*) in Netscape format (`# Netscape HTTP Cookie File` or `#HttpOnly_` lines). Pass the file with:
 ```bash
 ./gomini --cookie-file cookie.txt
 ```
 
-### How to get cookies
-
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account
-2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
-3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
-4. Create `cookie.txt` in this format:
-
-```
-SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value
-```
-
-Or use the JSON format:
-
-```json
-{
-  "cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx",
-  "sapisid": "your_sapisid_value"
-}
-```
-
-### Authenticated account path and XSRF token
-
-If the signed-in Gemini page URL contains an account index, such as:
-
-```
-https://gemini.google.com/u/1/app/...
-```
-
-set `auth_user` to that index. Authenticated web requests may also require the page XSRF token. In the rendered Gemini page source, this token is exposed as `SNlM0e`; pass it as `xsrf_token` in `config.json`. The server sends it as the `at` form field.
-
-Example:
-
-```json
-{
-  "cookie_file": "/etc/gomini/cookie.txt",
-  "auth_user": "1",
-  "xsrf_token": "AOOh0P...",
-  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
-}
-```
-
-If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini Web, update `xsrf_token`, and make sure `auth_user` matches the `/u/<index>/` part of the browser URL.
-
-Pro routing requires **Gemini Advanced** (paid subscription). A free Google account cookie will authenticate but silently fall back to Flash.
+### 3. Dynamic BL & XSRF Token Refresh
+On startup and automatically on HTTP 400/405 errors, `gomini` fetches fresh `SNlM0e` XSRF tokens and build labels (`gemini_bl`) directly from `https://gemini.google.com/app`.
 
 ## Configuration
 
-Configuration is loaded from (in order of precedence):
+Configuration is loaded in strict precedence order:
 
-1. CLI flags: `--port`, `--host`, `--config`, etc.
-2. Environment variables: `GOMINI_PORT`, `GOMINI_HOST`, `GOMINI_RETRY_ATTEMPTS`, etc.
-3. Config file: `--config config.json` (or `GOMINI_CONFIG`, or auto-detected `config.json` in current directory)
+1. **CLI flags**: `--port`, `--host`, `--config`, etc. (highest precedence)
+2. **Environment variables**: `GOMINI_PORT`, `GOMINI_HOST`, `GOMINI_TEMPORARY_CHATS`, etc.
+3. **Config file**: `--config custom.json` (or `GOMINI_CONFIG`, or auto-detected `config.json` in working directory)
+4. **Built-in Defaults**: Port 8081, Host 0.0.0.0, etc.
 
 Create `config.json`:
 
@@ -177,27 +173,37 @@ Create `config.json`:
   "api_keys": [],
   "cookie_file": null,
   "proxy": null,
-  "log_requests": true
+  "log_requests": true,
+  "temporary_chats": false,
+  "send_model_ticket": true,
+  "ticket_timeout_sec": 25,
+  "idle_timeout_sec": 90,
+  "model_tickets": {}
 }
 ```
 
-When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` (case-insensitive) or `x-api-key: <key>`.
 
 ### CLI flags
 
 ```
---port              HTTP listen port (default: 8081)
---host              HTTP listen address (default: 0.0.0.0)
---config            Path to config JSON file
---retry-attempts    Number of retries for upstream requests (default: 3)
---request-timeout   Upstream request timeout in seconds (default: 180)
---gemini-bl         Gemini build label (bl parameter)
---default-model     Default model name (default: gemini-3.6-flash)
---cookie-file       Path to cookie file
---proxy             HTTP proxy URL
---auth-user         Google auth user index
---xsrf-token        XSRF token
---log-requests      Enable request logging (default: true)
+--port                HTTP listen port (default: 8081)
+--host                HTTP listen address (default: 0.0.0.0)
+--config              Path to config JSON file
+--retry-attempts      Number of retries for upstream requests (default: 3)
+--retry-delay         Delay between retries in seconds (default: 2)
+--request-timeout     Upstream request timeout in seconds (default: 180)
+--ticket-timeout      Timeout in seconds for model ticket requests (default: 25)
+--idle-timeout        Idle timeout in seconds for upstream connections (default: 90)
+--gemini-bl           Gemini build label (bl parameter)
+--default-model       Default model name (default: gemini-3.6-flash)
+--cookie-file         Path to cookie file (supports Netscape format)
+--proxy               HTTP proxy URL
+--auth-user           Google auth user index
+--xsrf-token          XSRF token
+--log-requests        Enable request logging (default: true)
+--temporary-chats     Use temporary/incognito chats without Google history (default: false)
+--send-model-ticket   Send X-Goog-Ext-525001261-Jspb model routing header (default: true)
 ```
 
 ## Docker
@@ -270,20 +276,25 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Agent & IDE Setup (Issue #108 / #107)
+
+`gomini` acts as a drop-in local OpenAI endpoint for AI coding agents and developer environments:
+
+- **Cherry Studio / Chatbox / NextChat**: Set Provider to OpenAI, Base URL to `http://localhost:8081/v1`, and choose `gemini-4-argon` or `gemini-3.8-flash`.
+- **OpenWebUI**: Add an OpenAI connection pointing to `http://localhost:8081/v1`.
+- **Antigravity CLI / Cursor / Cline**: Configure OpenAI-compatible provider with base URL `http://localhost:8081/v1`.
+
 ## Limitations
 
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
-- **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
-- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
+- **Not real Pro/Argon without Account**: Without an authorized Gemini cookie, requests for `gemini-4-argon` or `gemini-3.1-pro` automatically fall back to `gemini-3.7-flash` or `gemini-3.6-flash`.
+- **Single-turn web channel**: Multi-turn history is sent as full context in each request payload.
+- **Google Rate Limits**: High-frequency requests may encounter rate limits or temporary IP challenges from Google Web.
 
 ## How It Works
 
-This tool reverse-engineers Google Gemini's web StreamGenerate protocol. It sends requests to the same endpoint that the Gemini web app uses, converting between OpenAI's API format and Gemini's internal JSON format.
+This tool bridges OpenAI-compatible API requests to Google Gemini's web StreamGenerate protocol. It authenticates with Google via session cookies and SAPISID hashes, builds JSPB payload arrays, maps model routing via the `X-Goog-Ext-525001261-Jspb` header ticket mechanism (with automatic fallback on rejection), and streams Server-Sent Events (SSE) back to clients in standard OpenAI format.
 
-The model selection is controlled by field `[79]` in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum).
-
-Building from source requires Go 1.26+. The compiled binary has zero external dependencies.
+Building from source requires Go 1.23+. The compiled binary has zero external runtime dependencies.
 
 ---
 

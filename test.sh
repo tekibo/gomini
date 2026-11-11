@@ -82,6 +82,21 @@ check_body "POST /v1/chat/completions"  '"error"|"choices"|"object"' \
     -H "Content-Type: application/json" \
     -d '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 
+check_body "POST /v1/chat/completions (argon)" '"error"|"choices"|"object"' \
+  curl -s -X POST "$BASE/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gemini-4-argon","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+check_status "POST /v1/chat/completions (SSRF loopback rejected)" 502 \
+  "$BASE/v1/chat/completions" -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1:8080/image.png"}}]}]}'
+
+check_status "POST /v1/chat/completions (SSRF metadata rejected)" 502 \
+  "$BASE/v1/chat/completions" -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://169.254.169.254/latest/meta-data"}}]}]}'
+
 check_body "POST /v1/responses" '"error"|"output"|"status"' \
   curl -s -X POST "$BASE/v1/responses" \
     -H "Content-Type: application/json" \
