@@ -12,16 +12,19 @@ import (
 	"strings"
 )
 
+// CookieLoader loads cookies and SAPISID tokens from a path.
 type CookieLoader interface {
 	Load(path string) (cookie, sapisid string)
 }
 
+// Uploader uploads images to Google's Scotty resumable upload endpoint.
 type Uploader struct {
 	client     *http.Client
 	cookiePath string
 	cookies    CookieLoader
 }
 
+// NewUploader constructs a new Uploader.
 func NewUploader(client *http.Client, cookiePath string, cookies CookieLoader) *Uploader {
 	return &Uploader{
 		client:     client,
@@ -87,10 +90,12 @@ func FetchImageBytes(ctx context.Context, client *http.Client, urlStr string) ([
 	return io.ReadAll(resp.Body)
 }
 
+// FetchImageBytes fetches an image from an HTTP/HTTPS URL.
 func (u *Uploader) FetchImageBytes(ctx context.Context, urlStr string) ([]byte, error) {
 	return FetchImageBytes(ctx, u.client, urlStr)
 }
 
+// UploadImage performs the 2-step resumable upload to Google Scotty and returns the upload blob path.
 func (u *Uploader) UploadImage(ctx context.Context, imageBytes []byte, mimeType string) (string, error) {
 	if len(imageBytes) == 0 {
 		return "", fmt.Errorf("empty image bytes")

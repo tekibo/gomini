@@ -18,6 +18,7 @@ var rePushID = regexp.MustCompile(`"qKIAYe":"([^"]+)"`)
 var rePctx = regexp.MustCompile(`"Ylro7b":"([^"]+)"`)
 var reAt = regexp.MustCompile(`"thykhd":"([^"]+)"`)
 
+// PageTokens represents push and context tokens retrieved from the Gemini web page.
 type PageTokens struct {
 	PushID string
 	Pctx   string
@@ -85,6 +86,7 @@ func (u *Uploader) getPageTokens(ctx context.Context) PageTokens {
 	return tokens
 }
 
+// MakeSapisidHash calculates the SAPISIDHASH header value for Google authentication.
 func MakeSapisidHash(sapisid string) string {
 	h := sha1.New()
 	ts := time.Now().Unix()

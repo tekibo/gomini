@@ -2,5 +2,6 @@ config.json
 compose.yml
 gomini
 cookie.txt
+cookies.txt
 gemini-auth.json
 

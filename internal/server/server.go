@@ -12,6 +12,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -21,31 +23,42 @@ import (
 
 const version = "1.1.0"
 
+// GeminiClient defines generation methods required by the HTTP server.
 type GeminiClient interface {
-	Generate(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) (string, error)
-	GenerateStream(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) <-chan gemini.StreamEvent
+	Generate(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) (string, error)
+	GenerateStream(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) <-chan gemini.StreamEvent
 	SetLogger(func(string))
 }
 
+// Uploader defines image upload operations.
 type Uploader interface {
 	UploadImage(ctx context.Context, imageBytes []byte, mimeType string) (string, error)
 	FetchImageBytes(ctx context.Context, urlStr string) ([]byte, error)
 }
 
+// Config holds server configuration settings.
 type Config struct {
-	APIKeys      []string
-	DefaultModel string
-	LogRequests  bool
+	APIKeys         []string
+	DefaultModel    string
+	LogRequests     bool
+	SendModelTicket bool
+	ModelTickets    map[string]string
+	CookieFile      *string
+	CookieStore     *gemini.CookieStore
 }
 
+// NewConfig returns a default server configuration.
 func NewConfig(apiKeys []string, defaultModel string, logReqs bool) *Config {
 	return &Config{
-		APIKeys:      apiKeys,
-		DefaultModel: defaultModel,
-		LogRequests:  logReqs,
+		APIKeys:         apiKeys,
+		DefaultModel:    defaultModel,
+		LogRequests:     logReqs,
+		SendModelTicket: true,
+		ModelTickets:    make(map[string]string),
 	}
 }
 
+// Server is the HTTP server for OpenAI and Gemini proxy endpoints.
 type Server struct {
 	config   *Config
 	gemini   GeminiClient
@@ -53,6 +66,7 @@ type Server struct {
 	mux      *http.ServeMux
 }
 
+// New creates and initializes an HTTP API server.
 func New(cfg *Config, geminiClient GeminiClient, uploader Uploader) *Server {
 	s := &Server{
 		config:   cfg,
@@ -86,6 +100,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/chat/completions", s.withMiddleware(s.handleChat))
 	s.mux.HandleFunc("POST /v1/responses", s.withMiddleware(s.handleResponses))
 	s.mux.HandleFunc("POST /v1beta/models/", s.withMiddleware(s.handleGoogleV1beta))
+	s.mux.HandleFunc("POST /v1/cookies", s.handleCookiesSync)
 	s.mux.HandleFunc("GET /", s.handleHealth)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("OPTIONS /", s.handleCORS)
@@ -131,14 +146,89 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"version": version,
 	})
 }
 
-func (s *Server) handleCORS(w http.ResponseWriter, r *http.Request) {
+var re16Hex = regexp.MustCompile(`^[0-9a-fA-F]{16}$`)
+
+func (s *Server) handleCookiesSync(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host != "127.0.0.1" && host != "localhost" {
+		writeJSON(w, http.StatusForbidden, errorObj("forbidden: local access only"))
+		return
+	}
+	origin := r.Header.Get("Origin")
+	syncHeader := r.Header.Get("X-Gemini-Cookie-Sync")
+	if syncHeader != "1" && !strings.HasPrefix(origin, "chrome-extension://") {
+		writeJSON(w, http.StatusForbidden, errorObj("forbidden: extension auth required"))
+		return
+	}
+
+	var payload struct {
+		Cookie       string            `json:"cookie"`
+		Sapisid      string            `json:"sapisid"`
+		AuthUser     any               `json:"auth_user"`
+		ModelTickets map[string]string `json:"model_tickets"`
+	}
+	if err := parseBody(r, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
+		return
+	}
+	if strings.ContainsAny(payload.Cookie, "\r\n") {
+		writeJSON(w, http.StatusBadRequest, errorObj("invalid cookie: newline detected"))
+		return
+	}
+
+	if s.config.CookieStore != nil && payload.Cookie != "" {
+		s.config.CookieStore.Set(payload.Cookie, payload.Sapisid)
+	}
+
+	if payload.ModelTickets != nil {
+		if s.config.ModelTickets == nil {
+			s.config.ModelTickets = make(map[string]string)
+		}
+		for k, v := range payload.ModelTickets {
+			v = strings.ToLower(strings.TrimSpace(v))
+			if re16Hex.MatchString(v) && strings.TrimSpace(k) != "" {
+				s.config.ModelTickets[k] = v
+			}
+		}
+	}
+
+	if s.config.CookieFile != nil && *s.config.CookieFile != "" {
+		fPath := *s.config.CookieFile
+		existingData := make(map[string]any)
+		if content, err := os.ReadFile(fPath); err == nil && len(content) > 0 && content[0] == '{' {
+			_ = json.Unmarshal(content, &existingData)
+		}
+		if payload.Cookie != "" {
+			existingData["cookie"] = payload.Cookie
+		}
+		if payload.Sapisid != "" {
+			existingData["sapisid"] = payload.Sapisid
+		}
+		if payload.AuthUser != nil {
+			existingData["auth_user"] = payload.AuthUser
+		}
+		if len(s.config.ModelTickets) > 0 {
+			existingData["model_tickets"] = s.config.ModelTickets
+		}
+		if b, err := json.MarshalIndent(existingData, "", "  "); err == nil {
+			_ = os.WriteFile(fPath, b, 0600)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *Server) handleCORS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "*")

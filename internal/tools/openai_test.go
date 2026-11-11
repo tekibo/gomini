@@ -112,3 +112,35 @@ func TestToolsBlockTruncationWhenLarge(t *testing.T) {
 		t.Errorf("expected tool descriptions to be retained")
 	}
 }
+
+func TestClassifyCanned(t *testing.T) {
+	if ClassifyCanned("I'm having a hard time fulfilling your request right now.") != "failure" {
+		t.Errorf("expected 'failure' for hard time fulfilling request")
+	}
+	if ClassifyCanned("Sorry, something went wrong.") != "failure" {
+		t.Errorf("expected 'failure' for something went wrong")
+	}
+	if ClassifyCanned("I cannot execute tools directly because the tool call limit has been reached.") != "failure" {
+		t.Errorf("expected 'failure' for tool call limit reached")
+	}
+	if ClassifyCanned("I'm just a language model, and I can't help with that.") != "refusal" {
+		t.Errorf("expected 'refusal' for language model disclaimer")
+	}
+	if ClassifyCanned("Here is the answer to your question: 42.") != "" {
+		t.Errorf("expected empty string for normal response")
+	}
+}
+
+func TestParseToolCallsUnclosedAndEcho(t *testing.T) {
+	raw := "[Assistant]: Creating file.\n```tool_call\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\"}}\n"
+	clean, calls := ParseToolCalls(raw)
+	if clean != "Creating file." {
+		t.Errorf("expected clean 'Creating file.', got %q", clean)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(calls))
+	}
+	if calls[0].Function.Name != "write_file" {
+		t.Errorf("expected function write_file, got %s", calls[0].Function.Name)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"os"
 )
 
+// ApplyFlags parses command-line flags and overrides configuration values.
 func (c *Config) ApplyFlags() {
 	port := flag.Int("port", c.Port, "HTTP listen port")
 	host := flag.String("host", c.Host, "HTTP listen address")
@@ -20,6 +21,9 @@ func (c *Config) ApplyFlags() {
 	authUser := flag.String("auth-user", "", "Google auth user index")
 	xsrfToken := flag.String("xsrf-token", "", "XSRF token")
 	tempChats := flag.Bool("temporary-chats", c.TemporaryChats, "use temporary chats (do not persist history)")
+	sendTicket := flag.Bool("send-model-ticket", c.SendModelTicket, "send model ticket header")
+	ticketTimeout := flag.Int("ticket-timeout", c.TicketTimeoutSec, "timeout in seconds for model ticket requests")
+	idleTimeout := flag.Int("idle-timeout", c.IdleTimeoutSec, "idle timeout in seconds for upstream connections")
 	configPath := flag.String("config", "", "path to config file")
 	flag.Parse()
 
@@ -28,10 +32,13 @@ func (c *Config) ApplyFlags() {
 	c.RetryAttempts = *retry
 	c.RetryDelaySec = *retryDelay
 	c.RequestTimeoutSec = *timeout
+	c.TicketTimeoutSec = *ticketTimeout
+	c.IdleTimeoutSec = *idleTimeout
 	c.GeminiBL = *geminiBL
 	c.DefaultModel = *defaultModel
 	c.LogRequests = *logReqs
 	c.TemporaryChats = *tempChats
+	c.SendModelTicket = *sendTicket
 	if *cookieFile != "" {
 		c.CookieFile = cookieFile
 	}

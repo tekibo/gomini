@@ -8,6 +8,7 @@ import (
 	"strings"
 )
 
+// GoogleContentsToPrompt converts Google API contents into a Gemini web prompt and image inputs.
 func GoogleContentsToPrompt(contents []GoogleContent, systemInstruction string, tools []ToolDef, toolChoice string) (string, []ImageData) {
 	var parts []string
 	var images []ImageData
@@ -105,6 +106,7 @@ func GoogleContentsToPrompt(contents []GoogleContent, systemInstruction string, 
 var funcCallRe1 = regexp.MustCompile("(?s)```function_call\\s*\n(.*?)\n```")
 var funcCallRe2 = regexp.MustCompile("(?:^|\n)function_call\\s*\n(\\{[^`]*?\\})")
 
+// ParseGoogleFunctionCalls parses function_call code blocks and returns clean text and parsed calls.
 func ParseGoogleFunctionCalls(text string) (string, []FunctionCall) {
 	var funcCalls []FunctionCall
 	clean := text

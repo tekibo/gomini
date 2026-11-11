@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"gomini/internal/gemini"
@@ -13,11 +14,12 @@ import (
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Model      string          `json:"model"`
-		Messages   json.RawMessage `json:"messages"`
-		Tools      json.RawMessage `json:"tools,omitempty"`
-		ToolChoice any             `json:"tool_choice,omitempty"`
-		Stream     bool            `json:"stream"`
+		Model           string          `json:"model"`
+		Messages        json.RawMessage `json:"messages"`
+		Tools           json.RawMessage `json:"tools,omitempty"`
+		ToolChoice      any             `json:"tool_choice,omitempty"`
+		Stream          bool            `json:"stream"`
+		ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 	}
 
 	if err := parseBody(r, &req); err != nil {
@@ -30,7 +32,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		modelName = s.config.DefaultModel
 	}
 
-	resolvedName, modelID, thinkMode, extra, err := gemini.ResolveModel(modelName, s.config.DefaultModel)
+	resolvedName, modelID, thinkMode, extra, ticketHdr, err := gemini.ResolveModel(modelName, gemini.ResolveOptions{
+		DefaultModel:    s.config.DefaultModel,
+		ReasoningEffort: req.ReasoningEffort,
+		ModelTickets:    s.config.ModelTickets,
+		SendModelTicket: s.config.SendModelTicket,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
 		return
@@ -85,9 +92,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	cid := "chatcmpl-" + hexID(12)
 	created := time.Now().Unix()
+	hasTools := len(toolDefs) > 0 && toolChoice != "none"
 
-	if req.Stream && (len(toolDefs) == 0 || toolChoice == "none") {
-		s.streamChat(w, r.Context(), cid, created, resolvedName, modelID, thinkMode, extra, prompt, images)
+	if req.Stream {
+		s.streamChat(r.Context(), w, cid, created, resolvedName, modelID, thinkMode, extra, ticketHdr, prompt, images, toolDefs, toolChoice)
 		return
 	}
 
@@ -96,14 +104,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
 		return
 	}
-	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
+
+	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
 		return
 	}
 
+	// Canned error retry
+	if tools.ClassifyCanned(text) == "failure" {
+		for attempt := 0; attempt < 2; attempt++ {
+			t, retryErr := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
+			if retryErr == nil && tools.ClassifyCanned(t) != "failure" {
+				text = t
+				break
+			}
+		}
+	}
+
+	// Tutorial phrasing corrective retry when tools are active
+	if hasTools && tools.LooksLikeTutorial(text) {
+		correctedPrompt := prompt + "\n\n[Correction]: Please do not explain the steps. Use the provided tools to make the changes."
+		t, retryErr := s.gemini.Generate(r.Context(), correctedPrompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
+		if retryErr == nil && !tools.LooksLikeTutorial(t) {
+			text = t
+		}
+	}
+
 	var toolCalls []tools.ToolCall
-	if len(toolDefs) > 0 && text != "" && toolChoice != "none" {
+	if hasTools && text != "" {
 		text, toolCalls = tools.ParseToolCalls(text)
 	}
 
@@ -118,25 +147,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 		finish = "tool_calls"
-	}
-
-	if req.Stream {
-		startSSE(w)
-		chunk := map[string]any{
-			"id":      cid,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   resolvedName,
-			"choices": []map[string]any{
-				{"index": 0, "delta": msg, "finish_reason": finish},
-			},
-		}
-		_ = writeSSE(w, chunk)
-		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -159,13 +169,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, cid string, created int64, modelName string, modelID, thinkMode int, extra map[int]int, prompt string, images []tools.ImageData) {
+func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, cid string, created int64, modelName string, modelID, thinkMode int, extra map[int]int, ticketHdr, prompt string, images []tools.ImageData, toolDefs []tools.ToolDef, toolChoice any) {
 	fileRefs, err := s.uploadImages(ctx, images)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
 		return
 	}
-	ch := s.gemini.GenerateStream(ctx, prompt, modelID, thinkMode, fileRefs, extra)
 
 	startSSE(w)
 	flusher, ok := w.(http.Flusher)
@@ -173,50 +182,101 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, cid stri
 		flusher = nopFlusher{}
 	}
 
-	firstChunk := map[string]any{
-		"id":      cid,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   modelName,
-		"choices": []map[string]any{
-			{"index": 0, "delta": map[string]string{"role": "assistant"}, "finish_reason": nil},
-		},
-	}
-	_ = writeSSE(w, firstChunk)
-	flusher.Flush()
-
-	for evt := range ch {
-		if evt.Err != nil {
-			return
-		}
-		if evt.Delta == "" {
-			continue
-		}
+	sendChunk := func(delta map[string]any, finish any) {
 		chunk := map[string]any{
 			"id":      cid,
 			"object":  "chat.completion.chunk",
 			"created": created,
 			"model":   modelName,
 			"choices": []map[string]any{
-				{"index": 0, "delta": map[string]string{"content": evt.Delta}, "finish_reason": nil},
+				{"index": 0, "delta": delta, "finish_reason": finish},
 			},
 		}
-		if err := writeSSE(w, chunk); err != nil {
-			return
-		}
+		_ = writeSSE(w, chunk)
 		flusher.Flush()
 	}
 
-	end := map[string]any{
-		"id":      cid,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   modelName,
-		"choices": []map[string]any{
-			{"index": 0, "delta": map[string]string{}, "finish_reason": "stop"},
-		},
+	sendChunk(map[string]any{"role": "assistant"}, nil)
+
+	hasTools := len(toolDefs) > 0 && toolChoice != "none"
+	ch := s.gemini.GenerateStream(ctx, prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
+
+	if !hasTools {
+		for evt := range ch {
+			if evt.Err != nil {
+				sendChunk(map[string]any{"content": fmt.Sprintf("[error] %v", evt.Err)}, "stop")
+				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			if evt.Delta != "" {
+				sendChunk(map[string]any{"content": evt.Delta}, nil)
+			}
+		}
+		sendChunk(map[string]any{}, "stop")
+		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
 	}
-	_ = writeSSE(w, end)
+
+	fullText := ""
+	emitted := 0
+	markerPos := -1
+
+	for evt := range ch {
+		if evt.Err != nil {
+			sendChunk(map[string]any{"content": fmt.Sprintf("[error] %v", evt.Err)}, "stop")
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		if evt.Delta == "" {
+			continue
+		}
+		fullText += evt.Delta
+		if markerPos == -1 {
+			markerPos = strings.Index(fullText, tools.ToolCallMarker)
+		}
+		var limit int
+		if markerPos != -1 {
+			limit = markerPos
+		} else {
+			limit = len(fullText) - len(tools.ToolCallMarker) + 1
+			if limit < 0 {
+				limit = 0
+			}
+		}
+		if limit > emitted {
+			sendChunk(map[string]any{"content": fullText[emitted:limit]}, nil)
+			emitted = limit
+		}
+	}
+
+	clean, toolCalls := tools.ParseToolCalls(fullText)
+	if len(toolCalls) > 0 {
+		if len(clean) > emitted {
+			sendChunk(map[string]any{"content": clean[emitted:]}, nil)
+		}
+		for i, tc := range toolCalls {
+			tcMap := map[string]any{
+				"index": i,
+				"id":    tc.ID,
+				"type":  "function",
+				"function": map[string]string{
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				},
+			}
+			sendChunk(map[string]any{"tool_calls": []any{tcMap}}, nil)
+		}
+		sendChunk(map[string]any{}, "tool_calls")
+	} else {
+		if len(fullText) > emitted {
+			sendChunk(map[string]any{"content": fullText[emitted:]}, nil)
+		}
+		sendChunk(map[string]any{}, "stop")
+	}
+
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }

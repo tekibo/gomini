@@ -8,23 +8,29 @@ import (
 	"os"
 )
 
+// Config holds server configuration values.
 type Config struct {
-	Port              int      `json:"port"`
-	Host              string   `json:"host"`
-	RetryAttempts     int      `json:"retry_attempts"`
-	RetryDelaySec     int      `json:"retry_delay_sec"`
-	RequestTimeoutSec int      `json:"request_timeout_sec"`
-	GeminiBL          string   `json:"gemini_bl"`
-	AuthUser          *string  `json:"auth_user"`
-	XSRFToken         *string  `json:"xsrf_token"`
-	DefaultModel      string   `json:"default_model"`
-	LogRequests       bool     `json:"log_requests"`
-	CookieFile        *string  `json:"cookie_file"`
-	Proxy             *string  `json:"proxy"`
-	APIKeys           []string `json:"api_keys"`
-	TemporaryChats    bool     `json:"temporary_chats"`
+	Port              int               `json:"port"`
+	Host              string            `json:"host"`
+	RetryAttempts     int               `json:"retry_attempts"`
+	RetryDelaySec     int               `json:"retry_delay_sec"`
+	RequestTimeoutSec int               `json:"request_timeout_sec"`
+	TicketTimeoutSec  int               `json:"ticket_timeout_sec"`
+	IdleTimeoutSec    int               `json:"idle_timeout_sec"`
+	GeminiBL          string            `json:"gemini_bl"`
+	AuthUser          *string           `json:"auth_user"`
+	XSRFToken         *string           `json:"xsrf_token"`
+	DefaultModel      string            `json:"default_model"`
+	LogRequests       bool              `json:"log_requests"`
+	CookieFile        *string           `json:"cookie_file"`
+	Proxy             *string           `json:"proxy"`
+	APIKeys           []string          `json:"api_keys"`
+	TemporaryChats    bool              `json:"temporary_chats"`
+	SendModelTicket   bool              `json:"send_model_ticket"`
+	ModelTickets      map[string]string `json:"model_tickets,omitempty"`
 }
 
+// Default returns a Config initialized with default settings.
 func Default() *Config {
 	return &Config{
 		Port:              8081,
@@ -32,13 +38,18 @@ func Default() *Config {
 		RetryAttempts:     3,
 		RetryDelaySec:     2,
 		RequestTimeoutSec: 180,
+		TicketTimeoutSec:  25,
+		IdleTimeoutSec:    90,
 		GeminiBL:          "boq_assistant-bard-web-server_20260723.00_p0",
 		DefaultModel:      "gemini-3.6-flash",
 		LogRequests:       true,
 		TemporaryChats:    false,
+		SendModelTicket:   true,
+		ModelTickets:      make(map[string]string),
 	}
 }
 
+// LoadFile reads and decodes a JSON configuration file.
 func LoadFile(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {

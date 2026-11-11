@@ -11,12 +11,16 @@ import (
 
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Model        string          `json:"model"`
-		Instructions string          `json:"instructions"`
-		Input        json.RawMessage `json:"input"`
-		Tools        json.RawMessage `json:"tools,omitempty"`
-		ToolChoice   any             `json:"tool_choice,omitempty"`
-		Stream       bool            `json:"stream"`
+		Model           string          `json:"model"`
+		Instructions    string          `json:"instructions"`
+		Input           json.RawMessage `json:"input"`
+		Tools           json.RawMessage `json:"tools,omitempty"`
+		ToolChoice      any             `json:"tool_choice,omitempty"`
+		Stream          bool            `json:"stream"`
+		ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+		Reasoning       struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning,omitempty"`
 	}
 
 	if err := parseBody(r, &req); err != nil {
@@ -29,7 +33,17 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		modelName = s.config.DefaultModel
 	}
 
-	resolvedName, modelID, thinkMode, extra, err := gemini.ResolveModel(modelName, s.config.DefaultModel)
+	effort := req.ReasoningEffort
+	if effort == "" {
+		effort = req.Reasoning.Effort
+	}
+
+	resolvedName, modelID, thinkMode, extra, ticketHdr, err := gemini.ResolveModel(modelName, gemini.ResolveOptions{
+		DefaultModel:    s.config.DefaultModel,
+		ReasoningEffort: effort,
+		ModelTickets:    s.config.ModelTickets,
+		SendModelTicket: s.config.SendModelTicket,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
 		return
@@ -141,10 +155,20 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
 		return
 	}
-	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
+	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
 		return
+	}
+
+	if tools.ClassifyCanned(text) == "failure" {
+		for attempt := 0; attempt < 2; attempt++ {
+			t, retryErr := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
+			if retryErr == nil && tools.ClassifyCanned(t) != "failure" {
+				text = t
+				break
+			}
+		}
 	}
 
 	var toolCalls []tools.ToolCall

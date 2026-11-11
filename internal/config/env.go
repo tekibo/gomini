@@ -6,6 +6,7 @@ import (
 	"strings"
 )
 
+// ApplyEnv overrides configuration values from environment variables.
 func (c *Config) ApplyEnv() {
 	if v := os.Getenv("GOMINI_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
@@ -56,5 +57,18 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := os.Getenv("GOMINI_TEMPORARY_CHATS"); v != "" {
 		c.TemporaryChats = v == "1" || v == "true"
+	}
+	if v := os.Getenv("GOMINI_SEND_MODEL_TICKET"); v != "" {
+		c.SendModelTicket = v == "1" || v == "true"
+	}
+	if v := os.Getenv("GOMINI_TICKET_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.TicketTimeoutSec = n
+		}
+	}
+	if v := os.Getenv("GOMINI_IDLE_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.IdleTimeoutSec = n
+		}
 	}
 }

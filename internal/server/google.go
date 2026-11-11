@@ -11,7 +11,7 @@ import (
 	"gomini/internal/tools"
 )
 
-func (s *Server) handleGoogleModels(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGoogleModels(w http.ResponseWriter, _ *http.Request) {
 	var models []map[string]any
 	for name, cfg := range gemini.Models {
 		models = append(models, map[string]any{
@@ -24,7 +24,7 @@ func (s *Server) handleGoogleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
 }
 
-func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	var data []map[string]any
 	for name, cfg := range gemini.Models {
 		data = append(data, map[string]any{
@@ -55,7 +55,21 @@ func (s *Server) handleGoogleV1beta(w http.ResponseWriter, r *http.Request) {
 	}
 	stream := action == "streamGenerateContent"
 
-	resolvedName, modelID, thinkMode, extra, err := gemini.ResolveModel(modelName, s.config.DefaultModel)
+	thinkingLevel := ""
+	if gc, ok := req["generationConfig"].(map[string]any); ok {
+		if tc, ok := gc["thinkingConfig"].(map[string]any); ok {
+			if tl, ok := tc["thinkingLevel"].(string); ok {
+				thinkingLevel = tl
+			}
+		}
+	}
+
+	resolvedName, modelID, thinkMode, extra, ticketHdr, err := gemini.ResolveModel(modelName, gemini.ResolveOptions{
+		DefaultModel:    s.config.DefaultModel,
+		ReasoningEffort: thinkingLevel,
+		ModelTickets:    s.config.ModelTickets,
+		SendModelTicket: s.config.SendModelTicket,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorObj(err.Error()))
 		return
@@ -139,11 +153,11 @@ func (s *Server) handleGoogleV1beta(w http.ResponseWriter, r *http.Request) {
 	hasTools := len(toolDefs) > 0 && fcMode != "NONE"
 
 	if stream && !hasTools {
-		s.streamGoogleGenerate(w, r.Context(), resolvedName, modelID, thinkMode, extra, prompt, fileRefs)
+		s.streamGoogleGenerate(r.Context(), w, resolvedName, modelID, thinkMode, extra, ticketHdr, prompt, fileRefs)
 		return
 	}
 
-	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra)
+	text, err := s.gemini.Generate(r.Context(), prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorObj("upstream error: "+err.Error()))
 		return
@@ -205,8 +219,8 @@ func (s *Server) handleGoogleV1beta(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) streamGoogleGenerate(w http.ResponseWriter, ctx context.Context, modelName string, modelID, thinkMode int, extra map[int]int, prompt string, fileRefs []string) {
-	ch := s.gemini.GenerateStream(ctx, prompt, modelID, thinkMode, fileRefs, extra)
+func (s *Server) streamGoogleGenerate(ctx context.Context, w http.ResponseWriter, modelName string, modelID, thinkMode int, extra map[int]int, ticketHdr, prompt string, fileRefs []string) {
+	ch := s.gemini.GenerateStream(ctx, prompt, modelID, thinkMode, fileRefs, extra, ticketHdr)
 
 	startSSE(w)
 	flusher, ok := w.(http.Flusher)

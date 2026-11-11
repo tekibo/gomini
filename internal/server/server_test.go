@@ -14,20 +14,20 @@ import (
 )
 
 type mockGemini struct {
-	genFunc       func(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) (string, error)
-	genStreamFunc func(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) <-chan gemini.StreamEvent
+	genFunc       func(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) (string, error)
+	genStreamFunc func(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) <-chan gemini.StreamEvent
 }
 
-func (m *mockGemini) Generate(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) (string, error) {
+func (m *mockGemini) Generate(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) (string, error) {
 	if m.genFunc != nil {
-		return m.genFunc(ctx, prompt, modelID, thinkMode, fileRefs, extra)
+		return m.genFunc(ctx, prompt, modelID, thinkMode, fileRefs, extra, ticketHeader...)
 	}
 	return "mock response", nil
 }
 
-func (m *mockGemini) GenerateStream(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) <-chan gemini.StreamEvent {
+func (m *mockGemini) GenerateStream(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) <-chan gemini.StreamEvent {
 	if m.genStreamFunc != nil {
-		return m.genStreamFunc(ctx, prompt, modelID, thinkMode, fileRefs, extra)
+		return m.genStreamFunc(ctx, prompt, modelID, thinkMode, fileRefs, extra, ticketHeader...)
 	}
 	ch := make(chan gemini.StreamEvent, 2)
 	ch <- gemini.StreamEvent{Delta: "hel"}
@@ -43,7 +43,7 @@ type mockUploader struct {
 	uploadErr    error
 }
 
-func (u *mockUploader) UploadImage(ctx context.Context, imageBytes []byte, mimeType string) (string, error) {
+func (u *mockUploader) UploadImage(_ context.Context, _ []byte, _ string) (string, error) {
 	if u.uploadErr != nil {
 		return "", u.uploadErr
 	}
@@ -52,7 +52,7 @@ func (u *mockUploader) UploadImage(ctx context.Context, imageBytes []byte, mimeT
 	return ref, nil
 }
 
-func (u *mockUploader) FetchImageBytes(ctx context.Context, urlStr string) ([]byte, error) {
+func (u *mockUploader) FetchImageBytes(_ context.Context, _ string) ([]byte, error) {
 	return []byte("fake remote bytes"), nil
 }
 
@@ -124,7 +124,7 @@ func TestChatStreamStartsWithAssistantRole(t *testing.T) {
 
 func TestResponsesStreamFullEventSequence(t *testing.T) {
 	mockClient := &mockGemini{
-		genFunc: func(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) (string, error) {
+		genFunc: func(_ context.Context, _ string, _, _ int, _ []string, _ map[int]int, _ ...string) (string, error) {
 			return "hello", nil
 		},
 	}
@@ -196,7 +196,7 @@ func TestChatMultimodalUpload(t *testing.T) {
 	uploader := &mockUploader{}
 	var receivedRefs []string
 	mockClient := &mockGemini{
-		genFunc: func(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) (string, error) {
+		genFunc: func(_ context.Context, _ string, _, _ int, fileRefs []string, _ map[int]int, _ ...string) (string, error) {
 			receivedRefs = fileRefs
 			return "image analyzed", nil
 		},
@@ -223,5 +223,114 @@ func TestChatMultimodalUpload(t *testing.T) {
 	}
 	if len(receivedRefs) != 1 || receivedRefs[0] != "/uploaded/mock-image" {
 		t.Errorf("expected fileRefs [/uploaded/mock-image], got %v", receivedRefs)
+	}
+}
+
+func TestChatStreamWithTools(t *testing.T) {
+	mockClient := &mockGemini{
+		genStreamFunc: func(_ context.Context, _ string, _, _ int, _ []string, _ map[int]int, _ ...string) <-chan gemini.StreamEvent {
+			ch := make(chan gemini.StreamEvent, 2)
+			ch <- gemini.StreamEvent{Delta: "Creating file.\n"}
+			ch <- gemini.StreamEvent{Delta: "```tool_call\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\"}}\n```"}
+			close(ch)
+			return ch
+		},
+	}
+	s := New(NewConfig(nil, "gemini-3.6-flash", false), mockClient, &mockUploader{})
+
+	body := bytes.NewBufferString(`{
+		"model": "gemini-3.6-flash",
+		"stream": true,
+		"tools": [{"type": "function", "function": {"name": "write_file", "parameters": {}}}],
+		"messages": [{"role": "user", "content": "write file"}]
+	}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	respStr := w.Body.String()
+
+	// Parse SSE chunks to concatenate content deltas
+	var accumulatedContent string
+	var hasToolCallsDelta bool
+	var hasToolCallsFinish bool
+
+	scanner := bufio.NewScanner(strings.NewReader(respStr))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []any  `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason any `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err == nil && len(chunk.Choices) > 0 {
+			accumulatedContent += chunk.Choices[0].Delta.Content
+			if len(chunk.Choices[0].Delta.ToolCalls) > 0 {
+				hasToolCallsDelta = true
+			}
+			if chunk.Choices[0].FinishReason == "tool_calls" {
+				hasToolCallsFinish = true
+			}
+		}
+	}
+
+	if accumulatedContent != "Creating file.\n" {
+		t.Errorf("expected accumulated content 'Creating file.\n', got %q", accumulatedContent)
+	}
+	if !hasToolCallsDelta {
+		t.Errorf("expected tool_calls delta in stream output")
+	}
+	if !hasToolCallsFinish {
+		t.Errorf("expected finish_reason tool_calls in stream output")
+	}
+}
+
+func TestCookiesSyncEndpoint(t *testing.T) {
+	cs := &gemini.CookieStore{}
+	cfg := NewConfig(nil, "gemini-3.6-flash", false)
+	cfg.CookieStore = cs
+	s := New(cfg, &mockGemini{}, &mockUploader{})
+
+	// 1. Forbidden without extension header / chrome-extension origin
+	reqNoHeader := httptest.NewRequest("POST", "/v1/cookies", bytes.NewBufferString(`{"cookie": "a=b"}`))
+	wNoHeader := httptest.NewRecorder()
+	s.ServeHTTP(wNoHeader, reqNoHeader)
+	if wNoHeader.Code != http.StatusForbidden {
+		t.Errorf("expected 403 without extension header, got %d", wNoHeader.Code)
+	}
+
+	// 2. Forbidden with evil host
+	reqEvil := httptest.NewRequest("POST", "/v1/cookies", bytes.NewBufferString(`{"cookie": "a=b"}`))
+	reqEvil.Host = "evil.com:8081"
+	reqEvil.Header.Set("X-Gemini-Cookie-Sync", "1")
+	wEvil := httptest.NewRecorder()
+	s.ServeHTTP(wEvil, reqEvil)
+	if wEvil.Code != http.StatusForbidden {
+		t.Errorf("expected 403 with evil host, got %d", wEvil.Code)
+	}
+
+	// 3. Success with valid localhost and header
+	body := `{"cookie": "SID=valid_sid; SAPISID=valid_sapisid", "model_tickets": {"gemini-4-argon": "95a4c0abcba24364"}}`
+	reqOK := httptest.NewRequest("POST", "/v1/cookies", bytes.NewBufferString(body))
+	reqOK.Host = "127.0.0.1:8081"
+	reqOK.Header.Set("X-Gemini-Cookie-Sync", "1")
+	wOK := httptest.NewRecorder()
+	s.ServeHTTP(wOK, reqOK)
+
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", wOK.Code, wOK.Body.String())
+	}
+	if cfg.ModelTickets["gemini-4-argon"] != "95a4c0abcba24364" {
+		t.Errorf("expected model ticket for gemini-4-argon to be updated")
 	}
 }

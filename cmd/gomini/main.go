@@ -33,20 +33,25 @@ func main() {
 		RetryAttempts:     cfg.RetryAttempts,
 		RetryDelaySec:     cfg.RetryDelaySec,
 		RequestTimeoutSec: cfg.RequestTimeoutSec,
+		TicketTimeoutSec:  cfg.TicketTimeoutSec,
+		IdleTimeoutSec:    cfg.IdleTimeoutSec,
 		TemporaryChats:    cfg.TemporaryChats,
+		SendModelTicket:   cfg.SendModelTicket,
+		ModelTickets:      cfg.ModelTickets,
 	}
 
 	client := gemini.NewClient(geminiCfg)
 
-	// Attempt auto-updating BL from gemini.google.com at startup
-	blCtx, blCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if newBL, err := gemini.FetchLatestBL(blCtx, client.HTTPClient()); err == nil && newBL != "" {
-		geminiCfg.GeminiBL = newBL
-		cfg.GeminiBL = newBL
-	}
+	// Attempt auto-updating BL and XSRF from gemini.google.com at startup
+	blCtx, blCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = client.RefreshBLAndXSRF(blCtx)
 	blCancel()
 
 	srvCfg := server.NewConfig(cfg.APIKeys, cfg.DefaultModel, cfg.LogRequests)
+	srvCfg.SendModelTicket = cfg.SendModelTicket
+	srvCfg.ModelTickets = cfg.ModelTickets
+	srvCfg.CookieFile = cfg.CookieFile
+	srvCfg.CookieStore = client.CookieStore()
 
 	uploader := multimodal.NewUploader(
 		client.HTTPClient(),
@@ -64,6 +69,7 @@ func main() {
 	log.Printf("  Proxy:     %s", orStr(proxyStr(cfg.Proxy), "none"))
 	log.Printf("  BL:        %s", cfg.GeminiBL)
 	log.Printf("  Temporary: %s", boolStr(cfg.TemporaryChats))
+	log.Printf("  Ticket:    %s", boolStr(cfg.SendModelTicket))
 
 	httpSrv := &http.Server{
 		Addr:    addr,

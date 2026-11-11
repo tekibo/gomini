@@ -122,6 +122,7 @@ func imageFromPart(item any) (ImageData, bool) {
 	return ImageData{}, false
 }
 
+// MessagesToPrompt converts an array of OpenAI messages, tools, and tool_choice into a single prompt string and image inputs.
 func MessagesToPrompt(messages []Message, tools []ToolDef, toolChoice any) (string, []ImageData) {
 	var parts []string
 	var images []ImageData
@@ -229,14 +230,33 @@ func toContentPart(v any) (ContentPart, error) {
 	return cp, nil
 }
 
-var toolCallRe = regexp.MustCompile("(?s)```tool_call\\s*\n(.*?)\n```")
+var toolCallRe = regexp.MustCompile("(?s)```tool_call\\s*\n(.*?)(?:\n```|$)")
 
+// FindToolCallStart returns the index where a tool_call fence begins in text starting from offset start, or -1.
+func FindToolCallStart(text string, start int) int {
+	if start >= len(text) {
+		return -1
+	}
+	sub := text[start:]
+	idx := strings.Index(sub, ToolCallMarker)
+	if idx == -1 {
+		return -1
+	}
+	return start + idx
+}
+
+// ParseToolCalls extracts tool call fences from generated text and returns clean prose and parsed ToolCalls.
 func ParseToolCalls(text string) (string, []ToolCall) {
+	if skip := EchoPrefixLen(text); skip > 0 {
+		text = text[skip:]
+	}
+
 	var toolCalls []ToolCall
 	var cleanParts []string
 	lastEnd := 0
 
-	for _, m := range toolCallRe.FindAllStringSubmatchIndex(text, -1) {
+	indices := toolCallRe.FindAllStringSubmatchIndex(text, -1)
+	for _, m := range indices {
 		cleanParts = append(cleanParts, text[lastEnd:m[0]])
 		lastEnd = m[1]
 		body := strings.TrimSpace(text[m[2]:m[3]])
@@ -268,7 +288,10 @@ func ParseToolCalls(text string) (string, []ToolCall) {
 			},
 		})
 	}
-	cleanParts = append(cleanParts, text[lastEnd:])
+
+	if len(toolCalls) == 0 {
+		cleanParts = append(cleanParts, text[lastEnd:])
+	}
 	clean := strings.TrimSpace(strings.Join(cleanParts, ""))
 
 	return clean, toolCalls

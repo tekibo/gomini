@@ -14,6 +14,7 @@ import (
 	"time"
 )
 
+// Client communicates with the Gemini StreamGenerate backend.
 type Client struct {
 	cfg  *Config
 	http *http.Client
@@ -21,6 +22,7 @@ type Client struct {
 	log  func(string)
 }
 
+// Config defines client options and network timeouts.
 type Config struct {
 	GeminiBL          string
 	AuthUser          *string
@@ -32,10 +34,14 @@ type Config struct {
 	RetryAttempts     int
 	RetryDelaySec     int
 	RequestTimeoutSec int
+	TicketTimeoutSec  int
+	IdleTimeoutSec    int
 	Port              int
 	Host              string
 	APIKeys           []string
 	TemporaryChats    bool
+	SendModelTicket   bool
+	ModelTickets      map[string]string
 }
 
 var reBL = regexp.MustCompile(`(boq_assistant-bard-web-server_\d+\.\d+_p\d+)`)
@@ -57,13 +63,14 @@ func FetchLatestBL(ctx context.Context, client *http.Client) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	m := reBL.FindSubmatch(body)
+	m := reBL.FindStringSubmatch(string(body))
 	if len(m) > 1 {
-		return string(m[1]), nil
+		return m[1], nil
 	}
 	return "", fmt.Errorf("gemini_bl not found on page")
 }
 
+// UpdateBLIfNeeded checks and refreshes gemini_bl if changed.
 func (c *Client) UpdateBLIfNeeded(ctx context.Context) bool {
 	newBL, err := FetchLatestBL(ctx, c.http)
 	if err == nil && newBL != "" && newBL != c.cfg.GeminiBL {
@@ -74,6 +81,32 @@ func (c *Client) UpdateBLIfNeeded(ctx context.Context) bool {
 	return false
 }
 
+// RefreshBLAndXSRF fetches the Gemini app page to refresh both gemini_bl and the xsrf token (SNlM0e).
+func (c *Client) RefreshBLAndXSRF(ctx context.Context) bool {
+	cookiePath := ""
+	if c.cfg.CookieFile != nil {
+		cookiePath = *c.cfg.CookieFile
+	}
+	newBL, newXSRF, err := RefreshBLAndXSRF(ctx, c.http, c.cs, cookiePath, c.cfg.AuthUser)
+	if err != nil {
+		c.log(fmt.Sprintf("BL/XSRF refresh failed: %v", err))
+		return false
+	}
+	changed := false
+	if newBL != "" && newBL != c.cfg.GeminiBL {
+		c.log(fmt.Sprintf("BL auto-updated: %s -> %s", c.cfg.GeminiBL, newBL))
+		c.cfg.GeminiBL = newBL
+		changed = true
+	}
+	if newXSRF != "" && (c.cfg.XSRFToken == nil || *c.cfg.XSRFToken != newXSRF) {
+		c.log(fmt.Sprintf("XSRF token auto-updated (len %d)", len(newXSRF)))
+		c.cfg.XSRFToken = &newXSRF
+		changed = true
+	}
+	return changed
+}
+
+// NewClient creates and initializes a new Gemini client.
 func NewClient(cfg *Config) *Client {
 	transport := &http.Transport{}
 	if cfg.Proxy != nil && *cfg.Proxy != "" {
@@ -90,25 +123,35 @@ func NewClient(cfg *Config) *Client {
 			Timeout:   time.Duration(cfg.RequestTimeoutSec) * time.Second,
 		},
 		cs:  &CookieStore{},
-		log: func(msg string) {},
+		log: func(_ string) {},
 	}
 }
 
+// SetLogger configures a logging function for client operations.
 func (c *Client) SetLogger(logFn func(string)) {
 	c.log = logFn
 }
 
+// StreamEvent represents a text delta or error emitted during streaming generation.
 type StreamEvent struct {
 	Delta string
 	Err   error
 }
 
-func (c *Client) Generate(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) (string, error) {
-	body := c.buildPayload(prompt, modelID, thinkMode, fileRefs, extra)
-	reqURL := c.buildURL()
+// Generate sends a non-streaming request to Gemini and returns the extracted reply text.
+func (c *Client) Generate(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) (string, error) {
+	ticketHdr := ""
+	if len(ticketHeader) > 0 {
+		ticketHdr = ticketHeader[0]
+	}
 
 	var lastErr error
-	for attempt := 0; attempt < c.cfg.RetryAttempts; attempt++ {
+	attempts := c.cfg.RetryAttempts
+	if attempts < 1 {
+		attempts = 3
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -117,36 +160,59 @@ func (c *Client) Generate(ctx context.Context, prompt string, modelID, thinkMode
 			}
 		}
 
-		text, err := c.doRequest(ctx, reqURL, body)
+		reqUUID := uuid()
+		body := c.buildPayload(prompt, modelID, thinkMode, fileRefs, extra, reqUUID)
+		reqURL := c.buildURL()
+
+		reqCtx := ctx
+		if ticketHdr != "" && c.cfg.TicketTimeoutSec > 0 {
+			var cancel context.CancelFunc
+			reqCtx, cancel = context.WithTimeout(ctx, time.Duration(c.cfg.TicketTimeoutSec)*time.Second)
+			defer cancel()
+		}
+
+		text, err := c.doRequest(reqCtx, reqURL, body, ticketHdr, reqUUID, len(fileRefs) > 0)
 		if err == nil {
 			return text, nil
 		}
-		if strings.Contains(err.Error(), "HTTP 405") && c.UpdateBLIfNeeded(ctx) {
-			c.log("Retrying with updated BL...")
-			reqURL = c.buildURL()
-			text, err = c.doRequest(ctx, reqURL, body)
-			if err == nil {
-				return text, nil
-			}
+
+		if ticketHdr != "" {
+			c.log(fmt.Sprintf("Model ticket request failed (%v); falling back without ticket header", err))
+			ticketHdr = ""
+			continue
 		}
+
+		if (strings.Contains(err.Error(), "HTTP 405") || strings.Contains(err.Error(), "HTTP 400")) && c.RefreshBLAndXSRF(ctx) {
+			c.log("Retrying with refreshed BL/XSRF...")
+			continue
+		}
+
 		lastErr = err
-		c.log(fmt.Sprintf("Retry %d/%d: %v", attempt+1, c.cfg.RetryAttempts, err))
+		c.log(fmt.Sprintf("Retry %d/%d: %v", attempt+1, attempts, err))
 	}
 	return "", lastErr
 }
 
-func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) <-chan StreamEvent {
+// GenerateStream initiates streaming generation, emitting text chunks over the returned channel.
+func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, ticketHeader ...string) <-chan StreamEvent {
 	ch := make(chan StreamEvent)
+
+	ticketHdr := ""
+	if len(ticketHeader) > 0 {
+		ticketHdr = ticketHeader[0]
+	}
 
 	go func() {
 		defer close(ch)
 
-		body := c.buildPayload(prompt, modelID, thinkMode, fileRefs, extra)
-		reqURL := c.buildURL()
 		emittedRawText := ""
-
 		var lastErr error
-		for attempt := 0; attempt < c.cfg.RetryAttempts; attempt++ {
+		attempts := c.cfg.RetryAttempts
+		if attempts < 1 {
+			attempts = 3
+		}
+
+		for attempt := 0; attempt < attempts; attempt++ {
 			if attempt > 0 {
 				select {
 				case <-ctx.Done():
@@ -156,22 +222,40 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thi
 				}
 			}
 
-			err := c.doStreamRequest(ctx, reqURL, body, &emittedRawText, ch)
+			reqUUID := uuid()
+			body := c.buildPayload(prompt, modelID, thinkMode, fileRefs, extra, reqUUID)
+			reqURL := c.buildURL()
+
+			reqCtx := ctx
+			if ticketHdr != "" && c.cfg.TicketTimeoutSec > 0 && emittedRawText == "" {
+				var cancel context.CancelFunc
+				reqCtx, cancel = context.WithTimeout(ctx, time.Duration(c.cfg.TicketTimeoutSec)*time.Second)
+				defer cancel()
+			}
+
+			err := c.doStreamRequest(reqCtx, reqURL, body, ticketHdr, reqUUID, len(fileRefs) > 0, &emittedRawText, ch)
 			if err == nil {
 				return
 			}
-			if strings.Contains(err.Error(), "HTTP 405") && c.UpdateBLIfNeeded(ctx) {
-				c.log("BL updated, falling back to non-streaming for this request")
-				raw, genErr := c.Generate(ctx, prompt, modelID, thinkMode, fileRefs, extra)
-				if genErr == nil && raw != "" {
-					ch <- StreamEvent{Delta: raw}
-				} else if genErr != nil {
-					ch <- StreamEvent{Err: genErr}
-				}
+
+			if emittedRawText != "" {
+				c.log(fmt.Sprintf("Stream interrupted after partial output (%d chars), ending cleanly: %v", len(emittedRawText), err))
 				return
 			}
+
+			if ticketHdr != "" {
+				c.log(fmt.Sprintf("Stream model ticket failed (%v); falling back without ticket header", err))
+				ticketHdr = ""
+				continue
+			}
+
+			if (strings.Contains(err.Error(), "HTTP 405") || strings.Contains(err.Error(), "HTTP 400")) && c.RefreshBLAndXSRF(ctx) {
+				c.log("Stream retrying with refreshed BL/XSRF...")
+				continue
+			}
+
 			lastErr = err
-			c.log(fmt.Sprintf("Stream retry %d/%d: %v", attempt+1, c.cfg.RetryAttempts, err))
+			c.log(fmt.Sprintf("Stream retry %d/%d: %v", attempt+1, attempts, err))
 		}
 		if lastErr != nil {
 			ch <- StreamEvent{Err: lastErr}
@@ -181,12 +265,12 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string, modelID, thi
 	return ch
 }
 
-func (c *Client) doRequest(ctx context.Context, reqURL, body string) (string, error) {
+func (c *Client) doRequest(ctx context.Context, reqURL, body, ticketHdr, reqUUID string, hasFileRefs bool) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
-	c.setHeaders(req)
+	c.setHeaders(req, ticketHdr, reqUUID, hasFileRefs)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -205,18 +289,18 @@ func (c *Client) doRequest(ctx context.Context, reqURL, body string) (string, er
 
 	rawStr := string(raw)
 	if match := bardErrorRE.FindStringSubmatch(rawStr); match != nil {
-		return "", fmt.Errorf("gemini upstream rejected request: BardErrorInfo [%s]", match[1])
+		return "", formatBardError(match[1])
 	}
 
 	return extractResponseText(rawStr), nil
 }
 
-func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, emittedRawText *string, ch chan<- StreamEvent) error {
+func (c *Client) doStreamRequest(ctx context.Context, reqURL, body, ticketHdr, reqUUID string, hasFileRefs bool, emittedRawText *string, ch chan<- StreamEvent) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create stream request: %w", err)
 	}
-	c.setHeaders(req)
+	c.setHeaders(req, ticketHdr, reqUUID, hasFileRefs)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -234,10 +318,8 @@ func (c *Client) doStreamRequest(ctx context.Context, reqURL, body string, emitt
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		if bardErrorRE.MatchString(line) {
-			if match := bardErrorRE.FindStringSubmatch(line); match != nil {
-				return fmt.Errorf("gemini upstream rejected request: BardErrorInfo [%s]", match[1])
-			}
+		if match := bardErrorRE.FindStringSubmatch(line); match != nil {
+			return formatBardError(match[1])
 		}
 
 		texts := extractTextsFromLine(line)
@@ -267,7 +349,24 @@ var cleanRE = regexp.MustCompile(
 	"```(?:python|javascript|text)\\?code_(?:reference|stdout)&code_event_index=\\d+\\n.*?```\\n?",
 )
 var cardRE = regexp.MustCompile(`http://googleusercontent\.com/card_content/\d+\n?`)
-var bardErrorRE = regexp.MustCompile(`BardErrorInfo\s*\[(\d+)\]`)
+var bardErrorRE = regexp.MustCompile(`BardErrorInfo"?,?\s*\[(\d+)\]`)
+
+func formatBardError(code string) error {
+	hint := ""
+	switch code {
+	case "1060":
+		hint = ": IP temporarily blocked"
+	case "1037":
+		hint = ": usage limit exceeded"
+	case "1013":
+		hint = ": transient upstream error"
+	case "1003":
+		hint = ": file not bound to conversation"
+	case "1185":
+		hint = ": request rejected"
+	}
+	return fmt.Errorf("gemini upstream error [%s]%s", code, hint)
+}
 
 func cleanText(text string, strip ...bool) string {
 	doStrip := true
@@ -283,7 +382,7 @@ func cleanText(text string, strip ...bool) string {
 }
 
 func extractTextsFromLine(line string) []string {
-	if !strings.Contains(line, "wrb.fr") || len(line) < 200 {
+	if !strings.Contains(line, "wrb.fr") {
 		return nil
 	}
 
@@ -305,9 +404,6 @@ func extractTextsFromLine(line string) []string {
 
 	var innerStr string
 	if err := json.Unmarshal(first[2], &innerStr); err != nil {
-		return nil
-	}
-	if len(innerStr) < 50 {
 		return nil
 	}
 
@@ -358,16 +454,17 @@ func extractResponseText(raw string) string {
 	return cleanText(lastText)
 }
 
-func (c *Client) buildPayload(prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int) string {
-	inner := make([]any, 102)
-
+func (c *Client) buildPayload(prompt string, modelID, thinkMode int, fileRefs []string, extra map[int]int, reqUUID string) string {
+	var inner []any
 	if len(fileRefs) > 0 {
+		inner = make([]any, 81)
 		refs := make([][]any, len(fileRefs))
 		for i, ref := range fileRefs {
-			refs[i] = []any{nil, nil, ref}
+			refs[i] = []any{[]string{ref}, "image.png"}
 		}
 		inner[0] = []any{prompt, 0, nil, refs, nil, nil, 0}
 	} else {
+		inner = make([]any, 102)
 		inner[0] = []any{prompt, 0, nil, nil, nil, nil, 0}
 	}
 
@@ -388,10 +485,13 @@ func (c *Client) buildPayload(prompt string, modelID, thinkMode int, fileRefs []
 		inner[41] = []int{2}
 	}
 	inner[53] = 0
-	inner[59] = uuid()
+	inner[59] = reqUUID
 	inner[61] = []any{}
 	inner[68] = 1
 	inner[79] = modelID
+	if len(fileRefs) > 0 {
+		inner[80] = 1
+	}
 
 	for k, v := range extra {
 		inner[k] = v
@@ -421,7 +521,7 @@ func (c *Client) buildURL() string {
 	)
 }
 
-func (c *Client) setHeaders(req *http.Request) {
+func (c *Client) setHeaders(req *http.Request, ticketHdr, reqUUID string, hasFileRefs bool) {
 	prefix := ""
 	if c.cfg.AuthUser != nil && *c.cfg.AuthUser != "" {
 		prefix = fmt.Sprintf("/u/%s", *c.cfg.AuthUser)
@@ -432,9 +532,16 @@ func (c *Client) setHeaders(req *http.Request) {
 	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", prefix))
 	req.Header.Set("X-Same-Domain", "1")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Connection", "close")
 
 	if c.cfg.AuthUser != nil && *c.cfg.AuthUser != "" {
 		req.Header.Set("X-Goog-AuthUser", *c.cfg.AuthUser)
+	}
+	if ticketHdr != "" && c.cfg.SendModelTicket {
+		req.Header.Set("X-Goog-Ext-525001261-Jspb", ticketHdr)
+	}
+	if hasFileRefs && reqUUID != "" {
+		req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, reqUUID))
 	}
 
 	cookiePath := ""
@@ -456,5 +563,8 @@ func uuid() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-func (c *Client) HTTPClient() *http.Client  { return c.http }
+// HTTPClient returns the underlying *http.Client.
+func (c *Client) HTTPClient() *http.Client { return c.http }
+
+// CookieStore returns the client's cookie store.
 func (c *Client) CookieStore() *CookieStore { return c.cs }

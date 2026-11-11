@@ -55,7 +55,13 @@ pass "go build"
 echo "=== Start server ==="
 "./$BINARY" --config "$CONFIG" &
 SERVER_PID=$!
-sleep 2
+
+for _ in {1..20}; do
+  if curl -s "$BASE/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
 check "server started" kill -0 "$SERVER_PID"
 
 echo "=== Endpoints ==="
@@ -63,8 +69,13 @@ echo "=== Endpoints ==="
 check_body "GET  /"                  '"status":"ok"'          curl -s "$BASE/"
 check_body "GET  /health"            '"status":"ok"'          curl -s "$BASE/health"
 check_body "GET  /v1/models"         'gemini-3.7-flash'       curl -s "$BASE/v1/models"
+check_body "GET  /v1/models (argon)" 'gemini-4-argon'         curl -s "$BASE/v1/models"
+check_body "GET  /v1/models (3.8)"   'gemini-3.8-flash'       curl -s "$BASE/v1/models"
 check_body "GET  /v1beta/models"     'gemini-3.7-flash'       curl -s "$BASE/v1beta/models"
 check_status "OPTIONS /"            204                       "$BASE/" -X OPTIONS
+
+check_status "POST /v1/cookies (no auth)" 403                 "$BASE/v1/cookies" -X POST -H "Content-Type: application/json" -d '{"cookie":"a=b"}'
+check_status "POST /v1/cookies (valid)"   200                 "$BASE/v1/cookies" -X POST -H "Content-Type: application/json" -H "X-Gemini-Cookie-Sync: 1" -d '{"cookie":"SID=foo; SAPISID=bar"}'
 
 check_body "POST /v1/chat/completions"  '"error"|"choices"|"object"' \
   curl -s -X POST "$BASE/v1/chat/completions" \
